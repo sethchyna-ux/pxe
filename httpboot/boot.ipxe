@@ -1,0 +1,116 @@
+#!ipxe
+# Custom PXE Netboot Menu
+# Dynamic Variables: ${server_ip} and ${http_port} are interpolated by pxe-rs
+
+set base_url http://${server_ip}:${http_port}
+
+# Console visual styling
+console --picture ${base_url}/splash.png --x 1024 --y 768 || true
+
+:start
+menu PXE Netboot Menu [Client MAC: ${mac} | Arch: ${buildarch}]
+item --gap --             ---------------- Linux Distributions ----------------
+item ubuntu               Ubuntu 24.04 LTS Live Server
+item mint                 Linux Mint 22 (Cinnamon 64-bit)
+item arch                 Arch Linux (Latest Rolling Netboot)
+item fedora               Fedora 44 Server (Netinstall)
+item solus                Solus Budgie Desktop (Live ISO)
+item alpine               Alpine Linux (Fast RAM Boot ~20MB)
+item --gap --             ---------------- Diagnostics & Multi-Boot -----------
+item netboot_xyz          Chainload netboot.xyz (50+ Cloud OS Catalog)
+item memtest              Memtest86+ Memory Diagnostics
+item --gap --             ---------------- System Control ---------------------
+item ipxe_shell           Drop to interactive iPXE shell
+item reboot               Reboot host
+item exit                 Exit and boot from local drive
+choose --timeout 20000 --default ubuntu target && goto ${target}
+
+# -----------------------------------------------------------------------------
+# Ubuntu 24.04 LTS Live Server
+# -----------------------------------------------------------------------------
+:ubuntu
+echo Booting Ubuntu 24.04 Live Server from ${base_url}...
+kernel ${base_url}/ubuntu/vmlinuz ip=dhcp url=${base_url}/ubuntu/ubuntu-24.04.4-live-server-amd64.iso autoinstall ds=nocloud-net;s=${base_url}/ubuntu/ cloud-config-url=/dev/null quiet ---
+initrd ${base_url}/ubuntu/initrd
+boot || goto failed
+
+# -----------------------------------------------------------------------------
+# Linux Mint 22 (Cinnamon)
+# -----------------------------------------------------------------------------
+:mint
+echo Booting Linux Mint 22 from ${base_url}...
+kernel ${base_url}/mint/vmlinuz boot=casper netboot=url url=${base_url}/mint/linuxmint-22-cinnamon-64bit.iso quiet splash --- || goto mint_iso
+initrd ${base_url}/mint/initrd.lz || initrd ${base_url}/mint/initrd
+boot || goto failed
+
+:mint_iso
+echo Falling back to direct ISO sanboot for Linux Mint...
+sanboot --no-describe ${base_url}/mint/linuxmint-22-cinnamon-64bit.iso || goto failed
+
+# -----------------------------------------------------------------------------
+# Arch Linux (Rolling Netboot)
+# -----------------------------------------------------------------------------
+:arch
+echo Booting Arch Linux Netboot from ${base_url}...
+kernel ${base_url}/arch/vmlinuz-linux initrd=initramfs-linux.img ip=dhcp archiso_http_srv=https://geo.mirror.pkgbuild.com/iso/latest/ cms_verify=y archisobasedir=arch cow_spacesize=4G quiet
+initrd ${base_url}/arch/initramfs-linux.img
+boot || goto failed
+
+# -----------------------------------------------------------------------------
+# Fedora 44 Server
+# -----------------------------------------------------------------------------
+:fedora
+echo Booting Fedora 44 Server from ${base_url}...
+kernel ${base_url}/fedora/vmlinuz ip=dhcp inst.repo=https://mirrors.kernel.org/fedora/releases/44/Server/x86_64/os/ quiet
+initrd ${base_url}/fedora/initrd.img
+boot || goto failed
+
+# -----------------------------------------------------------------------------
+# Solus Budgie Desktop
+# -----------------------------------------------------------------------------
+:solus
+echo Booting Solus from ${base_url}...
+sanboot --no-describe ${base_url}/solus/Solus-Budgie-Release-2026-04-18.iso || goto solus_extract
+
+:solus_extract
+echo Loading extracted Solus kernel...
+kernel ${base_url}/solus/vmlinuz root=live:http://${server_ip}:${http_port}/solus/Solus-Budgie-Release-2026-04-18.iso ro rd.luks=0 rd.md=0 quiet
+initrd ${base_url}/solus/initrd.img
+boot || goto failed
+
+# -----------------------------------------------------------------------------
+# Alpine Linux (Fast RAM boot)
+# -----------------------------------------------------------------------------
+:alpine
+echo Booting Alpine Linux from ${base_url}...
+kernel ${base_url}/alpine/vmlinuz-virt ip=dhcp alpine_repo=https://dl-cdn.alpinelinux.org/alpine/v3.20/main/ modloop=${base_url}/alpine/modloop-virt quiet
+initrd ${base_url}/alpine/initramfs-virt
+boot || goto failed
+
+# -----------------------------------------------------------------------------
+# Utilities & Diagnostic Tools
+# -----------------------------------------------------------------------------
+:memtest
+echo Loading Memtest86+...
+kernel ${base_url}/tools/memtest.bin
+boot || goto failed
+
+:netboot_xyz
+echo Loading upstream netboot.xyz cloud catalog...
+chain --autofree https://boot.netboot.xyz || goto failed
+
+:ipxe_shell
+echo Type 'exit' to return to menu, or run iPXE commands directly.
+shell
+goto start
+
+:reboot
+reboot
+
+:exit
+exit
+
+:failed
+echo Boot execution failed. Press any key to return to menu...
+prompt
+goto start
