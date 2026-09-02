@@ -65,6 +65,13 @@ cat << 'EOF' > "$APP_DIR/Contents/Info.plist"
     <string>12.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
 </dict>

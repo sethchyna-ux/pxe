@@ -1,126 +1,105 @@
 import Cocoa
 import WebKit
 
-class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate {
     var window: NSWindow!
     var webView: WKWebView!
-    var pxeProcess: Process?
+    var retryTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Configure App Menu
         setupMenu()
 
-        // Setup Main Window
+        // 1. Setup Native Dark macOS Window
         let rect = NSRect(x: 0, y: 0, width: 1150, height: 780)
         window = NSWindow(
             contentRect: rect,
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.center()
         window.title = "PXE Server Dashboard"
-        window.titlebarAppearsTransparent = true
         window.appearance = NSAppearance(named: .darkAqua)
         window.minSize = NSSize(width: 850, height: 550)
         window.delegate = self
 
-        // Setup WebKit View
+        // 2. Setup WebKit View
         let config = WKWebViewConfiguration()
         webView = WKWebView(frame: window.contentView!.bounds, configuration: config)
         webView.autoresizingMask = [.width, .height]
-        webView.setValue(false, forKey: "drawsBackground") // Transparent background until loaded
+        webView.navigationDelegate = self
         window.contentView!.addSubview(webView)
 
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
 
-        // Ensure Server is running, then load dashboard
-        ensureServerRunning { [weak self] success in
-            DispatchQueue.main.async {
-                self?.loadDashboard()
-            }
-        }
+        // 3. Immediately begin loading dashboard (auto-retries until server is up)
+        loadDashboard()
+
+        // 4. Launch backend daemon in background if not already running
+        startDaemonInBackground()
     }
 
     func loadDashboard() {
         if let url = URL(string: "http://127.0.0.1:8080/dashboard") {
-            let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10.0)
+            let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 3.0)
             self.webView.load(request)
         }
     }
 
-    func ensureServerRunning(completion: @escaping (Bool) -> Void) {
-        // 1. Check if server already active on 8080
-        checkServerActive { active in
-            if active {
-                print("PXE server already active on port 8080.")
-                completion(true)
-                return
-            }
-
-            // 2. Locate pxe binary
-            let bundlePath = Bundle.main.bundlePath
-            var pxeBin = (bundlePath as NSString).appendingPathComponent("Contents/MacOS/pxe")
-            if !FileManager.default.fileExists(atPath: pxeBin) {
-                // Fallback to local dev paths
-                let devPath = "/Users/yocan/pxe/target/release/pxe"
-                if FileManager.default.fileExists(atPath: devPath) {
-                    pxeBin = devPath
-                } else {
-                    pxeBin = "/usr/local/bin/pxe"
-                }
-            }
-
-            let pxeDir = "/Users/yocan/pxe"
-            let cmd = "killall -9 pxe 2>/dev/null || true; cd \(pxeDir) && \(pxeBin) serve --mode standalone --dhcp-range 192.168.1.200,192.168.1.240 --dhcp-router 192.168.1.1 --dhcp-dns 1.1.1.1 --no-tui"
-
-            // Elevate privileges using AppleScript for low UDP ports (67, 69)
-            let script = "do shell script \"\(cmd) > /tmp/pxe_app.log 2>&1 &\" with administrator privileges"
-            var error: NSDictionary?
-            if let appleScript = NSAppleScript(source: script) {
-                appleScript.executeAndReturnError(&error)
-                if let err = error {
-                    print("Admin elevation cancelled or error: \(err)")
-                }
-            }
-
-            // Wait up to 3 seconds for server to initialize
-            DispatchQueue.global().async {
-                for _ in 0..<15 {
-                    usleep(200_000) // 200ms
-                    var isUp = false
-                    let sema = DispatchSemaphore(value: 0)
-                    self.checkServerActive { up in
-                        isUp = up
-                        sema.signal()
-                    }
-                    sema.wait()
-                    if isUp {
-                        completion(true)
-                        return
-                    }
-                }
-                completion(false)
-            }
+    // Auto-retry loading whenever connection is refused (e.g. server booting / Touch ID prompt active)
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        retryTimer?.invalidate()
+        retryTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { [weak self] _ in
+            self?.loadDashboard()
         }
     }
 
-    func checkServerActive(completion: @escaping (Bool) -> Void) {
-        guard let url = URL(string: "http://127.0.0.1:8080/api/status") else {
-            completion(false)
-            return
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        retryTimer?.invalidate()
+        retryTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { [weak self] _ in
+            self?.loadDashboard()
         }
-        var req = URLRequest(url: url)
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        retryTimer?.invalidate()
+        retryTimer = nil
+    }
+
+    func startDaemonInBackground() {
+        // Check if port 8080 is already alive
+        guard let checkUrl = URL(string: "http://127.0.0.1:8080/api/status") else { return }
+        var req = URLRequest(url: checkUrl)
         req.timeoutInterval = 0.8
-        let task = URLSession.shared.dataTask(with: req) { _, resp, _ in
+
+        URLSession.shared.dataTask(with: req) { _, resp, _ in
             if let http = resp as? HTTPURLResponse, http.statusCode == 200 {
-                completion(true)
-            } else {
-                completion(false)
+                return // Server is already alive and running!
             }
-        }
-        task.resume()
+
+            // Launch daemon with admin privileges on background thread
+            DispatchQueue.global(qos: .userInitiated).async {
+                let bundlePath = Bundle.main.bundlePath
+                var pxeBin = (bundlePath as NSString).appendingPathComponent("Contents/MacOS/pxe")
+                if !FileManager.default.fileExists(atPath: pxeBin) {
+                    let devPath = "/Users/yocan/pxe/target/release/pxe"
+                    pxeBin = FileManager.default.fileExists(atPath: devPath) ? devPath : "/usr/local/bin/pxe"
+                }
+
+                let pxeDir = "/Users/yocan/pxe"
+                let cmd = "killall -9 pxe 2>/dev/null || true; cd '\(pxeDir)' && '\(pxeBin)' serve --mode standalone --dhcp-range 192.168.1.200,192.168.1.240 --dhcp-router 192.168.1.1 --dhcp-dns 1.1.1.1 --no-tui"
+                let script = "do shell script \"\(cmd) > /tmp/pxe_app.log 2>&1 &\" with administrator privileges"
+
+                var error: NSDictionary?
+                if let appleScript = NSAppleScript(source: script) {
+                    appleScript.executeAndReturnError(&error)
+                    if let err = error {
+                        print("Admin authorization notice: \(err)")
+                    }
+                }
+            }
+        }.resume()
     }
 
     func setupMenu() {
@@ -159,7 +138,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc func reloadDashboard() {
-        self.webView.reload()
+        self.loadDashboard()
     }
 
     @objc func openInBrowser() {
@@ -177,10 +156,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return true
-    }
-
-    func applicationWillTerminate(_ notification: Notification) {
-        // Optional cleanup on quit
     }
 }
 
