@@ -11,12 +11,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::services::ServeDir;
 
+use std::time::Instant;
+use serde::Serialize;
+use crate::state::{ClientSnapshot, MetricsSnapshot, PxeEvent};
+
+const DASHBOARD_HTML: &str = include_str!("dashboard.html");
+
 #[derive(Clone)]
 pub struct HttpServerContext {
     pub state: Arc<SharedState>,
     pub server_ip: Ipv4Addr,
     pub http_port: u16,
     pub http_dir: PathBuf,
+    pub start_time: Instant,
 }
 
 pub struct HttpServer {
@@ -36,6 +43,7 @@ impl HttpServer {
                 server_ip,
                 http_port,
                 http_dir,
+                start_time: Instant::now(),
             },
         }
     }
@@ -63,6 +71,9 @@ impl HttpServer {
 
         let ctx = self.ctx.clone();
         let app = Router::new()
+            .route("/", get(handle_root_or_dashboard))
+            .route("/dashboard", get(handle_dashboard))
+            .route("/api/status", get(handle_api_status))
             .route("/boot.ipxe", get(handle_boot_ipxe))
             .fallback_service(ServeDir::new(&self.ctx.http_dir))
             .layer(middleware::from_fn_with_state(
@@ -142,6 +153,106 @@ async fn handle_boot_ipxe(State(ctx): State<HttpServerContext>) -> impl IntoResp
         ],
         script_content,
     )
+}
+
+#[derive(Serialize)]
+struct ApiStatusResponse {
+    server_ip: String,
+    http_port: u16,
+    uptime_secs: u64,
+    metrics: MetricsSnapshot,
+    clients: Vec<ClientSnapshot>,
+    events: Vec<PxeEvent>,
+}
+
+async fn handle_dashboard() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8")),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-cache, no-store")),
+        ],
+        DASHBOARD_HTML,
+    )
+}
+
+async fn handle_root_or_dashboard(
+    State(ctx): State<HttpServerContext>,
+    req: Request,
+) -> impl IntoResponse {
+    let accept = req
+        .headers()
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if accept.contains("text/html") {
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8")),
+                (header::CACHE_CONTROL, HeaderValue::from_static("no-cache, no-store")),
+            ],
+            DASHBOARD_HTML,
+        )
+            .into_response();
+    }
+
+    let index_file = ctx.http_dir.join("index.html");
+    if index_file.exists() {
+        match tokio::fs::read_to_string(&index_file).await {
+            Ok(content) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"))],
+                content,
+            )
+                .into_response(),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    } else {
+        (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8")),
+                (header::CACHE_CONTROL, HeaderValue::from_static("no-cache, no-store")),
+            ],
+            DASHBOARD_HTML,
+        )
+            .into_response()
+    }
+}
+
+async fn handle_api_status(State(ctx): State<HttpServerContext>) -> impl IntoResponse {
+    let uptime_secs = ctx.start_time.elapsed().as_secs();
+    let metrics = ctx.state.metrics_snapshot();
+    let clients = ctx.state.client_snapshots();
+    let events = ctx.state.get_events();
+
+    let resp = ApiStatusResponse {
+        server_ip: ctx.server_ip.to_string(),
+        http_port: ctx.http_port,
+        uptime_secs,
+        metrics,
+        clients,
+        events,
+    };
+
+    match serde_json::to_string(&resp) {
+        Ok(json) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, HeaderValue::from_static("application/json")),
+                (header::CACHE_CONTROL, HeaderValue::from_static("no-cache, no-store")),
+            ],
+            json,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Serialization error: {e}"),
+        )
+            .into_response(),
+    }
 }
 
 pub fn generate_default_ipxe_script(server_ip: Ipv4Addr, http_port: u16) -> String {

@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::Serialize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum EventLevel {
     Info,
     Success,
@@ -12,7 +14,7 @@ pub enum EventLevel {
     Error,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Protocol {
     Dhcp,
     Tftp,
@@ -20,7 +22,7 @@ pub enum Protocol {
     System,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PxeEvent {
     pub timestamp: String,
     pub level: EventLevel,
@@ -28,7 +30,7 @@ pub struct PxeEvent {
     pub message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum BootStage {
     Discovering,
     Offered(Ipv4Addr),
@@ -46,6 +48,16 @@ pub struct ClientSession {
     pub last_seen: Instant,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ClientSnapshot {
+    pub mac: String,
+    pub ip: Option<String>,
+    pub arch: String,
+    pub stage: BootStage,
+    pub stage_text: String,
+    pub last_seen_secs_ago: u64,
+}
+
 #[derive(Default)]
 pub struct Metrics {
     pub dhcp_in: AtomicU64,
@@ -54,6 +66,16 @@ pub struct Metrics {
     pub tftp_files: AtomicU64,
     pub http_requests: AtomicU64,
     pub errors: AtomicU64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsSnapshot {
+    pub dhcp_in: u64,
+    pub dhcp_out: u64,
+    pub tftp_bytes: u64,
+    pub tftp_files: u64,
+    pub http_requests: u64,
+    pub errors: u64,
 }
 
 pub struct SharedState {
@@ -160,6 +182,42 @@ impl SharedState {
 
     pub fn record_error(&self) {
         self.metrics.errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn metrics_snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            dhcp_in: self.metrics.dhcp_in.load(Ordering::Relaxed),
+            dhcp_out: self.metrics.dhcp_out.load(Ordering::Relaxed),
+            tftp_bytes: self.metrics.tftp_bytes.load(Ordering::Relaxed),
+            tftp_files: self.metrics.tftp_files.load(Ordering::Relaxed),
+            http_requests: self.metrics.http_requests.load(Ordering::Relaxed),
+            errors: self.metrics.errors.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn client_snapshots(&self) -> Vec<ClientSnapshot> {
+        let clients = self.get_clients();
+        let now = Instant::now();
+        clients
+            .into_iter()
+            .map(|c| {
+                let stage_text = match &c.stage {
+                    BootStage::Discovering => "Discovering (DHCP)".to_string(),
+                    BootStage::Offered(ip) => format!("Offered ({ip})"),
+                    BootStage::TftpTransfer { file, percent } => format!("TFTP {file} ({percent}%)"),
+                    BootStage::HttpBoot(path) => format!("HTTP {path}"),
+                    BootStage::Booted => "Booted".to_string(),
+                };
+                ClientSnapshot {
+                    mac: c.mac,
+                    ip: c.ip.map(|i| i.to_string()),
+                    arch: c.arch,
+                    stage: c.stage,
+                    stage_text,
+                    last_seen_secs_ago: now.duration_since(c.last_seen).as_secs(),
+                }
+            })
+            .collect()
     }
 }
 

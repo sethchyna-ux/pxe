@@ -1,103 +1,84 @@
 # ⚡ pxe-rs: High-Performance Rust PXE & Netboot Appliance
 
-A blazing fast, memory-safe, all-in-one PXE server daemon written in Rust. Features integrated **DHCP / ProxyDHCP**, RFC-compliant **TFTP** with `blksize` acceleration, high-throughput **HTTP** asset streaming, and an interactive **Ratatui Terminal UI** (TUI).
+A blazing fast, memory-safe, all-in-one PXE netboot server daemon written in Rust. Features integrated **DHCP / ProxyDHCP**, RFC-compliant **TFTP** with `blksize` acceleration, high-throughput **HTTP** asset streaming, an interactive **Ratatui Terminal UI** (TUI), a real-time **Web Dashboard**, and a native **macOS Application (`PXE Server.app`)**.
 
 ---
 
-## Key Features
+## 🌟 Key Features
 
-- **Coexists With Existing Routers (ProxyDHCP)**: Runs out of the box on existing home/lab networks alongside your existing router (UniFi, pfSense, OPNsense, OpenWrt, ISP router) without causing DHCP IP collisions.
-- **Standalone DHCP Mode**: Can alternatively function as an authoritative DHCP server with an integrated IP lease manager.
+- **One-Click Native macOS App (`PXE Server.app`)**:
+  - Launches with automatic Touch ID / Admin elevation to bind low-level ports (`UDP 67/69`).
+  - Native WebKit (`WKWebView`) dark-mode operations dashboard.
+  - Zero heavy third-party framework bloat (pure Swift AppKit + native Rust).
+- **Real-Time Web Dashboard (`/dashboard`)**:
+  - Accessible locally in the app and remotely from any phone, tablet, or browser on your LAN at `http://<server-ip>:8080/dashboard`.
+  - Real-time stat cards: active bare-metal nodes, DHCP in/out, TFTP bandwidth, HTTP requests, and error rate.
+  - Live client session tracking: MAC, assigned IP, architecture, boot stage, and last-seen timers.
+  - Streaming color-coded activity log: `[DHCP]`, `[TFTP]`, `[HTTP]`, `[SYS]`.
+- **Coexists With Existing Routers (ProxyDHCP)**:
+  - Runs on existing home/lab networks alongside your existing router (UniFi, pfSense, OPNsense, OpenWrt, ISP router) without causing DHCP IP collisions.
+- **Standalone DHCP Mode**:
+  - Functions as an authoritative DHCP server with an integrated IP lease manager for isolated switches.
 - **Hardware Architecture Auto-Detection**:
   - `0x0000` (Legacy BIOS x86) ➔ Serves `undionly.kpxe`
-  - `0x0007` / `0x0009` (UEFI x86_64) ➔ Serves `ipxe.efi`
+  - `0x0007` / `0x0009` (UEFI x86_64) ➔ Serves `ipxe.efi` (`snponly.efi`)
   - `0x000B` / `0x000C` (UEFI ARM64 / AArch64) ➔ Serves `ipxe-arm64.efi`
-- **iPXE Stage-2 HTTP Chainloading**: Detects when an iPXE client boots (Option 77 / Option 175) and immediately chainloads `http://<server-ip>:<http-port>/boot.ipxe`, downloading kernels and ISOs over HTTP at line speed.
 - **RFC-Compliant Accelerated TFTP**:
-  - RFC 1350 (TFTP protocol)
+  - RFC 1350 (TFTP protocol + strict EOF zero-byte packet handling)
   - RFC 2347 / 2348 (`blksize` option negotiation up to 1468 MTU)
   - RFC 2349 (`tsize` and `timeout` negotiation)
   - Built-in path canonicalization preventing directory traversal (`../`) attacks
-- **HTTP Engine (Axum)**:
-  - Serves kernels, initrds, and live ISOs with HTTP range-request support.
-  - Dynamically renders `boot.ipxe` with dynamic server IP and port substitution.
-- **Real-Time Terminal Dashboard (Ratatui + Crossterm)**:
-  - Live activity stream with color-coded protocol events.
-  - Active client lease table and detected hardware architectures.
-  - Bandwidth counters, transfer metrics, and error rates.
-  - Headless fallback (`--no-tui` or when piping stdout).
+- **High-Throughput HTTP Engine (Axum)**:
+  - Streams gigabyte-sized Linux live ISOs, kernels, and initrds at full wire speed.
+  - Dynamically interpolates server IP and port into iPXE scripts.
+- **Terminal UI (Ratatui + Crossterm)**:
+  - Keyboard-driven terminal dashboard for headless servers and SSH sessions.
 
 ---
 
-## Quick Start
+## 🚀 Quick Start
 
-### 1. Initialize Workspace Directories
+### Method 1: One-Click macOS App (Recommended)
 
-Run the `init` command to set up directory structures and default iPXE boot menus:
+Double-click to launch from:
+
+- 🖥️ **Desktop**: `~/Desktop/PXE Server.app`
+- 📁 **Applications**: `~/Applications/PXE Server.app`
+- 🛠️ **Project Root**: `./PXE Server.app`
+
+macOS will prompt for Touch ID or your password once to authorize port binding, and the dashboard window will immediately open.
+
+#### Rebuilding the macOS App
+
+```bash
+./macos/build_app.sh
+```
+
+---
+
+### Method 2: Command Line (CLI / TUI)
+
+#### 1. Initialize Directories
 
 ```bash
 cargo run --release -- init
 ```
 
-This generates:
+#### 2. Run Network Diagnostics
 
-```text
-pxe/
-├── tftpboot/        # Network bootloader binaries (ipxe.efi, undionly.kpxe)
-│   └── README.md
-└── httpboot/        # HTTP netboot files (kernels, ISOs, menus)
-    ├── boot.ipxe    # Dynamic netboot menu
-    ├── alpine/
-    ├── ubuntu/
-    └── tools/
-```
-
-### 2. Download Official Bootloader Binaries
-
-Download the signed upstream iPXE bootloaders into `tftpboot/`:
-
-```bash
-# UEFI x86_64
-curl -L -o tftpboot/ipxe.efi https://boot.ipxe.org/ipxe.efi
-
-# Legacy BIOS (x86)
-curl -L -o tftpboot/undionly.kpxe https://boot.ipxe.org/undionly.kpxe
-
-# UEFI ARM64 (AArch64)
-curl -L -o tftpboot/ipxe-arm64.efi https://boot.ipxe.org/arm64-efi/ipxe.efi
-```
-
-### 3. Check Network Diagnostic
-
-Verify that your primary LAN IPv4 address is automatically recognized:
+Check your host's active IP address and verify port availability:
 
 ```bash
 cargo run --release -- status
 ```
 
-### 4. Launch PXE Server
-
-Start the server in ProxyDHCP mode (requires `sudo` to bind standard UDP port 67 and UDP port 69):
+#### 3. Start in ProxyDHCP Mode (Alongside Existing Router)
 
 ```bash
 sudo ./target/release/pxe serve --mode proxy
 ```
 
----
-
-## Operating Modes
-
-### Mode 1: ProxyDHCP (Default & Recommended)
-
-In ProxyDHCP mode, your normal home router allocates the IP address to the machine. `pxe-rs` listens on UDP 67 (and UDP 4011) and provides only the PXE boot instructions (Option 60 `PXEClient`, Option 66 TFTP IP, and Option 67 bootloader filename).
-
-```bash
-sudo ./target/release/pxe serve --mode proxy
-```
-
-### Mode 2: Standalone DHCP Server
-
-If you are on an isolated lab network or switch without a router, `pxe-rs` can act as the authoritative DHCP server:
+#### 4. Start in Standalone DHCP Mode (Dedicated Server)
 
 ```bash
 sudo ./target/release/pxe serve \
@@ -107,84 +88,160 @@ sudo ./target/release/pxe serve \
   --dhcp-dns 1.1.1.1
 ```
 
-### Mode 3: Unprivileged / Lab Testing (Non-Root)
-
-To test in virtual machines or development environments without `sudo`:
+#### 5. Headless Daemon Mode (No TUI)
 
 ```bash
-./target/release/pxe serve \
-  --no-tui \
-  --dhcp-port 6767 \
-  --tftp-port 6969 \
-  --proxy-port 4012 \
-  --http-port 8085
+sudo ./target/release/pxe serve --mode standalone --dhcp-range 192.168.1.200,192.168.1.240 --no-tui
 ```
 
 ---
 
-## Terminal UI Hotkeys
+## 📊 Live Web Dashboard & REST API
 
-| Key | Description |
+The server exposes an HTTP API and interactive dashboard on TCP port 8080:
+
+- **Dashboard UI**: `http://127.0.0.1:8080/dashboard` (or `http://192.168.1.58:8080/dashboard`)
+- **Raw iPXE Script**: `http://127.0.0.1:8080/boot.ipxe`
+- **JSON Telemetry API**: `http://127.0.0.1:8080/api/status`
+
+### `GET /api/status` Response Example
+
+```json
+{
+  "server_ip": "192.168.1.58",
+  "http_port": 8080,
+  "uptime_secs": 184,
+  "metrics": {
+    "dhcp_in": 12,
+    "dhcp_out": 12,
+    "tftp_bytes": 1159680,
+    "tftp_files": 2,
+    "http_requests": 8,
+    "errors": 0
+  },
+  "clients": [
+    {
+      "mac": "f0:79:59:70:da:7f",
+      "ip": "192.168.1.200",
+      "arch": "UEFI (x86_64)",
+      "stage": "Booted",
+      "stage_text": "Booted",
+      "last_seen_secs_ago": 15
+    }
+  ],
+  "events": [
+    {
+      "timestamp": "13:10:00",
+      "level": "Success",
+      "protocol": "System",
+      "message": "Starting PXE-RS server on 192.168.1.58 [Standalone]"
+    }
+  ]
+}
+```
+
+---
+
+## 📁 Storage Architecture & OS Images
+
+All large distribution ISOs (~11 GB) are housed on `/Volumes/laptopcard/pxe/httpboot/` and symlinked directly into `httpboot/`:
+
+| Distribution | Files in `httpboot/<distro>/` | Size | Boot Mode |
+| :--- | :--- | :--- | :--- |
+| **Ubuntu 24.04 LTS Server** | `ubuntu-24.04.4-live-server-amd64.iso`, `vmlinuz`, `initrd` | 3.2 GB | Casper HTTP ISO Loopback |
+| **Linux Mint 22 (Cinnamon)** | `linuxmint-22-cinnamon-64bit.iso`, `vmlinuz`, `initrd.lz` | 2.8 GB | Casper Netboot |
+| **Arch Linux** | `vmlinuz-linux`, `initramfs-linux.img` | 250 MB | Rolling Official Netboot |
+| **Fedora 44 Server** | `vmlinuz`, `initrd.img` | 270 MB | Anaconda Netinstall |
+| **Solus Budgie Desktop** | `Solus-Budgie-Release-2026-04-18.iso` | 4.0 GB | Direct SANBOOT |
+| **Alpine Linux** | `vmlinuz-virt`, `initramfs-virt`, `modloop-virt` | 20 MB | Fast RAM Boot |
+| **netboot.xyz** | Upstream catalog chainload | Dynamic | 50+ Cloud Distros |
+
+---
+
+## 🖥️ Bare-Metal Motherboard Deployment (Hardware Quirks Guide)
+
+Deploying bare-metal netboot across real motherboards (such as the **ASUS Z97-A** / Intel Haswell) requires addressing several low-level firmware quirks:
+
+### 1. Haswell / 9-Series Intel I218-V PCIe Lockup
+
+- **Symptom**: `ipxe.efi` loads, displays `iPXE initialising devices...`, and completely freezes the system.
+- **Cause**: The full-driver build of `ipxe.efi` contains a native Intel PCIe driver that attempts to reset the PHY registers while UEFI firmware still controls the bus.
+- **Solution**: Deploy the official **`snponly.efi`** build (`301 KB`). It communicates exclusively through the UEFI Simple Network Protocol, avoiding the PCIe reset freeze.
+
+### 2. ASUS BIOS CSM & Option ROM Configuration
+
+For the motherboard to discover network boot targets:
+
+1. Enter BIOS (`Del` / `F2`).
+2. Go to **Advanced ➔ Onboard Devices Configuration** ➔ Set **Intel PXE OPROM** to **Enabled**.
+3. Go to **Boot ➔ CSM (Compatibility Support Module)** ➔ Set **Launch CSM** to **Enabled**.
+4. Set **Boot from Network Devices** to **UEFI driver first** (or **Legacy only**).
+5. In the Boot Menu (`F8`), select **`UEFI: IP4 Intel Ethernet Connection I218-V`** (or **`IBA GE Slot`** for Legacy).
+
+### 3. AMI UEFI Option 67 Null-Termination
+
+- **Symptom**: TFTP logs show errors like `File not found: ipxe.efi\ufffd`.
+- **Cause**: AMI UEFI reads DHCP Option 67 past the string boundary if not explicitly null-terminated.
+- **Solution**: `pxe-rs` appends an explicit `\0` byte to DHCP Options 66 and 67, and filters non-ASCII graphics in the TFTP engine.
+
+### 4. TFTP RFC 1350 Exact Block Multiples (EOF Bug)
+
+- **Symptom**: TFTP transfers freeze indefinitely on the last block (e.g., block 465 of 465).
+- **Cause**: RFC 1350 dictates that when a file length is an exact multiple of the block size (e.g. `238,080 / 512 = 465`), the server **must** send a terminating 0-byte DATA packet to signal EOF.
+- **Solution**: Handled automatically in `src/tftp/server.rs`.
+
+### 5. Preventing iPXE Bootloops
+
+In `httpboot/boot.ipxe`, the menu selection timeout is set to `0`:
+
+```ipxe
+choose --timeout 0 --default ubuntu target && goto ${target}
+```
+
+This keeps the menu on screen indefinitely until you press Enter, preventing continuous reboots.
+
+---
+
+## ⌨️ Terminal UI Controls
+
+When running via `./target/release/pxe serve`:
+
+| Key | Action |
 | :--- | :--- |
-| `q` or `Esc` | Cleanly terminate server and restore terminal |
-| `p` | Toggle live auto-scrolling on activity log |
-| `c` | Clear current event logs |
-| `d` | Filter activity log to DHCP events only |
-| `t` | Filter activity log to TFTP events only |
-| `h` | Filter activity log to HTTP events only |
+| `q` / `Esc` | Cleanly terminate server and restore terminal |
+| `p` | Toggle auto-scroll on activity log stream |
+| `c` | Clear log buffer |
+| `d` | Filter log to **DHCP** events only |
+| `t` | Filter log to **TFTP** events only |
+| `h` | Filter log to **HTTP** events only |
 | `↑` / `↓` | Scroll log buffer up / down |
 | `PageUp` / `PageDown` | Scroll log buffer by 10 lines |
 
 ---
 
-## Adding Operating System Images
+## 🛠️ Troubleshooting
 
-### Alpine Linux Netboot (Fast RAM Boot)
+### Port 67 Busy on macOS (`Address already in use - os error 48`)
 
-Download Alpine's netboot kernel and initramfs into `httpboot/alpine/`:
-
-```bash
-curl -o httpboot/alpine/vmlinuz-virt https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/netboot/vmlinuz-virt
-curl -o httpboot/alpine/initramfs-virt https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/netboot/initramfs-virt
-curl -o httpboot/alpine/modloop-virt https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/netboot/modloop-virt
-```
-
-### Ubuntu 24.04 LTS Live Installer
-
-Place the Ubuntu 24.04 ISO and extract `vmlinuz` and `initrd`:
-
-```bash
-# Place Ubuntu ISO inside httpboot/ubuntu/
-cp /path/to/ubuntu-24.04-live-server-amd64.iso httpboot/ubuntu/
-# Extract kernel and initrd from the ISO into httpboot/ubuntu/vmlinuz and httpboot/ubuntu/initrd
-```
-
----
-
-## Troubleshooting
-
-### Address already in use (os error 48) on macOS
-
-On macOS, Apple's built-in Internet Sharing / NetBoot daemon (`/usr/libexec/bootpd`) is socket-activated by `launchd` and holds UDP port 67 (`bootps`).
-
-To free UDP port 67 for your PXE server, run:
+macOS runs a background NetBoot/DHCP helper (`bootpd`). To release UDP 67:
 
 ```bash
 sudo launchctl bootout system/com.apple.bootpd
 ```
 
-To re-enable Apple's built-in service later (if ever needed):
+### Ubuntu Drops into Busybox `(initramfs)`
 
-```bash
-sudo launchctl bootstrap system /System/Library/LaunchDaemons/bootps.plist
-```
+- **Cause**: Booting with an Ubuntu Cloud-Image initrd (~29 MB) instead of the Casper Live Installer initrd (~76 MB).
+- **Fix**: Extract `casper/vmlinuz` and `casper/initrd` directly from `ubuntu-24.04.4-live-server-amd64.iso` (see [`httpboot/README.md`](httpboot/README.md)).
 
 ---
 
-## Running Automated Tests
+## 🧪 Testing
 
 ```bash
+# Run unit and integration tests
 cargo test
+
+# Validate codebase with zero warnings
 cargo clippy -- -D warnings
 ```
-

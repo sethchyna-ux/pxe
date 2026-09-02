@@ -1,0 +1,758 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PXE Server — Live Operations Dashboard</title>
+  <style>
+    :root {
+      --bg-base: #0b0f19;
+      --bg-surface: rgba(18, 24, 38, 0.75);
+      --bg-surface-elevated: rgba(27, 36, 56, 0.85);
+      --border-subtle: rgba(255, 255, 255, 0.08);
+      --border-bright: rgba(255, 255, 255, 0.16);
+      --accent-primary: #3b82f6;
+      --accent-cyan: #06b6d4;
+      --accent-emerald: #10b981;
+      --accent-purple: #8b5cf6;
+      --accent-amber: #f59e0b;
+      --accent-rose: #f43f5e;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+      --glass-blur: blur(16px);
+      --radius-sm: 8px;
+      --radius-md: 14px;
+      --radius-lg: 20px;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+      background-color: var(--bg-base);
+      background-image: 
+        radial-gradient(at 0% 0%, rgba(59, 130, 246, 0.12) 0px, transparent 50%),
+        radial-gradient(at 100% 100%, rgba(139, 92, 246, 0.10) 0px, transparent 50%);
+      background-attachment: fixed;
+      color: var(--text-main);
+      min-height: 100vh;
+      padding: 24px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* Container */
+    .dashboard {
+      max-width: 1400px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    /* Header */
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 18px 24px;
+      background: var(--bg-surface);
+      -webkit-backdrop-filter: var(--glass-blur);
+      backdrop-filter: var(--glass-blur);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .brand-icon {
+      width: 42px;
+      height: 42px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #2563eb, #7c3aed);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 4px 14px rgba(37, 99, 235, 0.4);
+    }
+
+    .brand-icon svg {
+      width: 24px;
+      height: 24px;
+      fill: none;
+      stroke: #fff;
+      stroke-width: 2;
+    }
+
+    .brand-title h1 {
+      font-size: 1.25rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    .brand-title p {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+    }
+
+    .header-status {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .live-indicator {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(16, 185, 129, 0.12);
+      color: var(--accent-emerald);
+      border: 1px solid rgba(16, 185, 129, 0.25);
+      padding: 6px 14px;
+      border-radius: 999px;
+      font-size: 0.8rem;
+      font-weight: 600;
+    }
+
+    .live-dot {
+      width: 8px;
+      height: 8px;
+      background-color: var(--accent-emerald);
+      border-radius: 50%;
+      box-shadow: 0 0 8px var(--accent-emerald);
+      animation: pulse 2s infinite ease-in-out;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(0.85); }
+    }
+
+    .header-badge {
+      background: var(--bg-surface-elevated);
+      border: 1px solid var(--border-subtle);
+      padding: 6px 12px;
+      border-radius: var(--radius-sm);
+      font-size: 0.8rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: var(--text-muted);
+    }
+
+    .header-badge strong {
+      color: var(--accent-primary);
+    }
+
+    /* Metric Cards Grid */
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 16px;
+    }
+
+    .metric-card {
+      background: var(--bg-surface);
+      -webkit-backdrop-filter: var(--glass-blur);
+      backdrop-filter: var(--glass-blur);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 18px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      position: relative;
+      overflow: hidden;
+      transition: transform 0.2s, border-color 0.2s;
+    }
+
+    .metric-card:hover {
+      transform: translateY(-2px);
+      border-color: var(--border-bright);
+    }
+
+    .metric-card::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 3px;
+      background: linear-gradient(90deg, transparent, var(--card-accent, var(--accent-primary)), transparent);
+    }
+
+    .card-dhcp { --card-accent: var(--accent-cyan); }
+    .card-tftp { --card-accent: var(--accent-purple); }
+    .card-http { --card-accent: var(--accent-emerald); }
+    .card-clients { --card-accent: var(--accent-primary); }
+    .card-errors { --card-accent: var(--accent-rose); }
+
+    .metric-label {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+
+    .metric-value {
+      font-size: 1.85rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      color: var(--text-main);
+    }
+
+    .metric-sub {
+      font-size: 0.78rem;
+      color: var(--text-dim);
+    }
+
+    /* Main Grid Layout */
+    .content-grid {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 20px;
+    }
+
+    @media (max-width: 1024px) {
+      .content-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    /* Glass Panels */
+    .panel {
+      background: var(--bg-surface);
+      -webkit-backdrop-filter: var(--glass-blur);
+      backdrop-filter: var(--glass-blur);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .panel-header {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .panel-title {
+      font-size: 0.95rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .badge-counter {
+      background: var(--bg-surface-elevated);
+      color: var(--accent-primary);
+      border: 1px solid var(--border-subtle);
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 700;
+    }
+
+    /* Table Styles */
+    .table-responsive {
+      overflow-x: auto;
+      max-height: 280px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+      text-align: left;
+    }
+
+    th {
+      padding: 12px 18px;
+      color: var(--text-dim);
+      font-weight: 600;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      border-bottom: 1px solid var(--border-subtle);
+      position: sticky;
+      top: 0;
+      background: rgba(18, 24, 38, 0.95);
+    }
+
+    td {
+      padding: 12px 18px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+      color: var(--text-main);
+    }
+
+    tr:last-child td {
+      border-bottom: none;
+    }
+
+    tr:hover td {
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-weight: 500;
+    }
+
+    .badge-arch {
+      background: rgba(59, 130, 246, 0.15);
+      color: #60a5fa;
+      border: 1px solid rgba(59, 130, 246, 0.25);
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 0.72rem;
+      font-weight: 600;
+    }
+
+    .badge-stage {
+      background: rgba(16, 185, 129, 0.15);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.25);
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 0.72rem;
+      font-weight: 600;
+    }
+
+    /* Logs Console */
+    .log-container {
+      background: #070a11;
+      padding: 14px 18px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+      font-size: 0.78rem;
+      height: 380px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .log-entry {
+      display: flex;
+      gap: 10px;
+      align-items: baseline;
+      line-height: 1.4;
+      animation: fadeIn 0.15s ease-out;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(2px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .log-time {
+      color: var(--text-dim);
+      flex-shrink: 0;
+    }
+
+    .log-proto {
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-weight: 700;
+      font-size: 0.7rem;
+      flex-shrink: 0;
+    }
+
+    .proto-dhcp { background: rgba(6, 182, 212, 0.2); color: var(--accent-cyan); }
+    .proto-tftp { background: rgba(139, 92, 246, 0.2); color: var(--accent-purple); }
+    .proto-http { background: rgba(16, 185, 129, 0.2); color: var(--accent-emerald); }
+    .proto-sys  { background: rgba(59, 130, 246, 0.2); color: var(--accent-primary); }
+
+    .log-msg {
+      color: #cbd5e1;
+      word-break: break-all;
+    }
+
+    .lvl-warn { color: var(--accent-amber); }
+    .lvl-err  { color: var(--accent-rose); font-weight: 600; }
+
+    /* Images List */
+    .images-list {
+      padding: 12px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .image-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px;
+      background: var(--bg-surface-elevated);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      font-size: 0.82rem;
+    }
+
+    .image-info {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .image-name {
+      font-weight: 600;
+      color: var(--text-main);
+    }
+
+    .image-sub {
+      font-size: 0.72rem;
+      color: var(--text-dim);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .image-tag {
+      background: rgba(16, 185, 129, 0.15);
+      color: var(--accent-emerald);
+      border: 1px solid rgba(16, 185, 129, 0.25);
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.7rem;
+      font-weight: 600;
+    }
+
+    /* Empty state */
+    .empty-placeholder {
+      padding: 30px;
+      text-align: center;
+      color: var(--text-dim);
+      font-size: 0.85rem;
+    }
+
+    /* Footer Buttons */
+    .dashboard-actions {
+      display: flex;
+      gap: 12px;
+      justify-content: flex-end;
+      align-items: center;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--bg-surface-elevated);
+      color: var(--text-main);
+      border: 1px solid var(--border-subtle);
+      padding: 8px 16px;
+      border-radius: var(--radius-sm);
+      font-size: 0.82rem;
+      font-weight: 600;
+      text-decoration: none;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+    }
+
+    .btn:hover {
+      background: rgba(255, 255, 255, 0.08);
+      border-color: var(--border-bright);
+    }
+
+    .text-emerald {
+      color: var(--accent-emerald);
+    }
+
+    .text-dim-sm {
+      font-size: 0.78rem;
+      color: var(--text-dim);
+    }
+
+    .text-emerald-sm {
+      font-size: 0.78rem;
+      color: var(--accent-emerald);
+    }
+
+    .column-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .btn-compact {
+      padding: 4px 10px;
+      font-size: 0.72rem;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="dashboard">
+    <!-- Header -->
+    <header>
+      <div class="brand">
+        <div class="brand-icon">
+          <svg viewBox="0 0 24 24">
+            <rect x="2" y="3" width="20" height="14" rx="2" />
+            <line x1="8" y1="21" x2="16" y2="21" />
+            <line x1="12" y1="17" x2="12" y2="21" />
+          </svg>
+        </div>
+        <div class="brand-title">
+          <h1>PXE Server Engine</h1>
+          <p>Rust Bare-Metal Netboot Daemon &amp; Hardware Dispatcher</p>
+        </div>
+      </div>
+
+      <div class="header-status">
+        <div class="header-badge">Host IP: <strong id="server-ip">192.168.1.58</strong></div>
+        <div class="header-badge">Uptime: <strong id="server-uptime">00:00:00</strong></div>
+        <div class="live-indicator">
+          <div class="live-dot"></div>
+          OPERATIONAL
+        </div>
+      </div>
+    </header>
+
+    <!-- Stat Metric Cards -->
+    <div class="metrics-grid">
+      <div class="metric-card card-clients">
+        <div class="metric-label">Active Clients</div>
+        <div class="metric-value" id="val-clients">0</div>
+        <div class="metric-sub">Connected bare-metal nodes</div>
+      </div>
+      <div class="metric-card card-dhcp">
+        <div class="metric-label">DHCP Packets</div>
+        <div class="metric-value" id="val-dhcp">0 / 0</div>
+        <div class="metric-sub">DISCOVER in / OFFER out</div>
+      </div>
+      <div class="metric-card card-tftp">
+        <div class="metric-label">TFTP Data</div>
+        <div class="metric-value" id="val-tftp">0.0 MB</div>
+        <div class="metric-sub" id="val-tftp-files">0 bootloaders served</div>
+      </div>
+      <div class="metric-card card-http">
+        <div class="metric-label">HTTP Requests</div>
+        <div class="metric-value" id="val-http">0</div>
+        <div class="metric-sub">Port 8080 kernel/ISO assets</div>
+      </div>
+      <div class="metric-card card-errors">
+        <div class="metric-label">System Health</div>
+        <div class="metric-value text-emerald" id="val-errors">100%</div>
+        <div class="metric-sub" id="val-errors-sub">0 protocol warnings</div>
+      </div>
+    </div>
+
+    <!-- Main Content Panels -->
+    <div class="content-grid">
+      <!-- Left Column: Active Clients & Distribution Catalog -->
+      <div class="column-stack">
+        <!-- Clients Panel -->
+        <div class="panel">
+          <div class="panel-header">
+            <div class="panel-title">
+              Connected Client Sessions
+              <span class="badge-counter" id="badge-client-count">0</span>
+            </div>
+            <div class="text-dim-sm">Auto-discovering UDP 67/68</div>
+          </div>
+          <div class="table-responsive">
+            <table>
+              <thead>
+                <tr>
+                  <th>Client MAC</th>
+                  <th>Assigned IP</th>
+                  <th>Architecture</th>
+                  <th>Boot Stage</th>
+                  <th>Last Seen</th>
+                </tr>
+              </thead>
+              <tbody id="clients-tbody">
+                <tr>
+                  <td colspan="5" class="empty-placeholder">Listening for PXE clients on your network...</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Distributions Panel -->
+        <div class="panel">
+          <div class="panel-header">
+            <div class="panel-title">Mounted Boot Catalog (/Volumes/laptopcard)</div>
+            <div class="text-emerald-sm">● Ready for Netboot</div>
+          </div>
+          <div class="images-list">
+            <div class="image-item">
+              <div class="image-info">
+                <span class="image-name">Ubuntu 24.04 LTS Server</span>
+                <span class="image-sub">ubuntu-24.04.4-live-server-amd64.iso (Casper 76MB initrd)</span>
+              </div>
+              <span class="image-tag">3.2 GB</span>
+            </div>
+            <div class="image-item">
+              <div class="image-info">
+                <span class="image-name">Linux Mint 22 (Cinnamon)</span>
+                <span class="image-sub">linuxmint-22-cinnamon-64bit.iso (vmlinuz + initrd.lz)</span>
+              </div>
+              <span class="image-tag">2.8 GB</span>
+            </div>
+            <div class="image-item">
+              <div class="image-info">
+                <span class="image-name">Arch Linux (Rolling)</span>
+                <span class="image-sub">vmlinuz-linux + initramfs-linux.img (Latest Netboot)</span>
+              </div>
+              <span class="image-tag">250 MB</span>
+            </div>
+            <div class="image-item">
+              <div class="image-info">
+                <span class="image-name">Fedora 44 Server</span>
+                <span class="image-sub">vmlinuz + initrd.img (Anaconda Netinstall)</span>
+              </div>
+              <span class="image-tag">270 MB</span>
+            </div>
+            <div class="image-item">
+              <div class="image-info">
+                <span class="image-name">Solus Budgie Desktop</span>
+                <span class="image-sub">Solus-Budgie-Release-2026-04-18.iso (Live Desktop)</span>
+              </div>
+              <span class="image-tag">4.0 GB</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right Column: Live Event Stream -->
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">Live Server Activity Stream</div>
+          <button class="btn btn-compact" id="btn-autoscroll">Scroll: ON</button>
+        </div>
+        <div class="log-container" id="log-stream">
+          <!-- Dynamically populated -->
+        </div>
+      </div>
+    </div>
+
+    <!-- Actions Footer -->
+    <div class="dashboard-actions">
+      <a href="/boot.ipxe" target="_blank" class="btn">View Raw iPXE Script</a>
+      <button class="btn" onclick="fetchStatus()">Refresh Status</button>
+    </div>
+  </div>
+
+  <script>
+    let autoscroll = true;
+    const btnScroll = document.getElementById('btn-autoscroll');
+    btnScroll.addEventListener('click', () => {
+      autoscroll = !autoscroll;
+      btnScroll.textContent = autoscroll ? 'Scroll: ON' : 'Scroll: OFF';
+      btnScroll.style.color = autoscroll ? 'var(--accent-emerald)' : 'var(--text-muted)';
+    });
+
+    function formatBytes(bytes) {
+      if (bytes === 0) return '0.0 MB';
+      const mb = (bytes / (1024 * 1024)).toFixed(1);
+      if (mb > 1024) {
+        return (mb / 1024).toFixed(2) + ' GB';
+      }
+      return mb + ' MB';
+    }
+
+    function formatUptime(secs) {
+      const h = Math.floor(secs / 3600).toString().padStart(2, '0');
+      const m = Math.floor((secs % 3600) / 60).toString().padStart(2, '0');
+      const s = Math.floor(secs % 60).toString().padStart(2, '0');
+      return `${h}:${m}:${s}`;
+    }
+
+    async function fetchStatus() {
+      try {
+        const res = await fetch('/api/status');
+        if (!res.ok) return;
+        const data = await res.json();
+
+        // Update Host & Uptime
+        document.getElementById('server-ip').textContent = data.server_ip + ':' + data.http_port;
+        document.getElementById('server-uptime').textContent = formatUptime(data.uptime_secs);
+
+        // Update Metric Counters
+        const clients = data.clients || [];
+        document.getElementById('val-clients').textContent = clients.length;
+        document.getElementById('badge-client-count').textContent = clients.length;
+
+        const m = data.metrics;
+        document.getElementById('val-dhcp').textContent = `${m.dhcp_in} / ${m.dhcp_out}`;
+        document.getElementById('val-tftp').textContent = formatBytes(m.tftp_bytes);
+        document.getElementById('val-tftp-files').textContent = `${m.tftp_files} bootloaders served`;
+        document.getElementById('val-http').textContent = m.http_requests;
+
+        const errElem = document.getElementById('val-errors');
+        const errSub = document.getElementById('val-errors-sub');
+        if (m.errors === 0) {
+          errElem.textContent = '100%';
+          errElem.style.color = 'var(--accent-emerald)';
+          errSub.textContent = '0 protocol errors';
+        } else {
+          errElem.textContent = `${m.errors} Errors`;
+          errElem.style.color = 'var(--accent-rose)';
+          errSub.textContent = 'Check activity logs below';
+        }
+
+        // Render Clients Table
+        const tbody = document.getElementById('clients-tbody');
+        if (clients.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="5" class="empty-placeholder">Listening for PXE clients on your network...</td></tr>';
+        } else {
+          tbody.innerHTML = clients.map(c => `
+            <tr>
+              <td class="mono"><strong>${c.mac}</strong></td>
+              <td class="mono">${c.ip || '<span style="color: var(--text-dim);">Acquiring...</span>'}</td>
+              <td><span class="badge-arch">${c.arch}</span></td>
+              <td><span class="badge-stage">${c.stage_text}</span></td>
+              <td style="color: var(--text-muted); font-size: 0.78rem;">${c.last_seen_secs_ago}s ago</td>
+            </tr>
+          `).join('');
+        }
+
+        // Render Event Logs
+        const logStream = document.getElementById('log-stream');
+        const events = data.events || [];
+        logStream.innerHTML = events.map(e => {
+          const protoClass = 'proto-' + e.protocol.toLowerCase();
+          const lvlClass = e.level === 'Warn' ? 'lvl-warn' : (e.level === 'Error' ? 'lvl-err' : '');
+          return `
+            <div class="log-entry">
+              <span class="log-time">${e.timestamp}</span>
+              <span class="log-proto ${protoClass}">[${e.protocol.toUpperCase()}]</span>
+              <span class="log-msg ${lvlClass}">${escapeHtml(e.message)}</span>
+            </div>
+          `;
+        }).join('');
+
+        if (autoscroll) {
+          logStream.scrollTop = logStream.scrollHeight;
+        }
+
+      } catch (err) {
+        console.warn('Status poll error:', err);
+      }
+    }
+
+    function escapeHtml(text) {
+      return text.replace(/[&<>"']/g, m => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
+      })[m]);
+    }
+
+    // Auto-poll every 1500ms
+    fetchStatus();
+    setInterval(fetchStatus, 1500);
+  </script>
+</body>
+</html>
