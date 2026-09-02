@@ -65,7 +65,10 @@ impl TftpPacket {
                     ));
                 }
 
-                let filename = tokens[0].clone();
+                let raw_filename = tokens[0].clone();
+                let filename = raw_filename
+                    .trim_matches(|c: char| !c.is_ascii_graphic())
+                    .to_string();
                 let mode = tokens[1].to_lowercase();
 
                 if opcode == OP_WRQ {

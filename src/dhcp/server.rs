@@ -353,15 +353,15 @@ impl DhcpServer {
             }
         }
 
-        // Option 66: TFTP Server Name / IP
-        reply
-            .options
-            .insert(66, self.server_ip.to_string().into_bytes());
+        // Option 66: TFTP Server Name / IP (null-terminated for UEFI ROMs)
+        let mut opt66 = self.server_ip.to_string().into_bytes();
+        opt66.push(0);
+        reply.options.insert(66, opt66);
 
-        // Option 67: Bootfile Name
-        reply
-            .options
-            .insert(67, bootfile.into_bytes());
+        // Option 67: Bootfile Name (null-terminated for UEFI ROMs)
+        let mut opt67 = bootfile.into_bytes();
+        opt67.push(0);
+        reply.options.insert(67, opt67);
 
         self.state.update_client(
             &req.mac_string(),
@@ -445,15 +445,15 @@ impl DhcpServer {
             }
         }
 
-        // Option 66: TFTP Server Name
-        reply
-            .options
-            .insert(66, self.server_ip.to_string().into_bytes());
+        // Option 66: TFTP Server Name (null-terminated for UEFI ROMs)
+        let mut opt66 = self.server_ip.to_string().into_bytes();
+        opt66.push(0);
+        reply.options.insert(66, opt66);
 
-        // Option 67: Bootfile Name
-        reply
-            .options
-            .insert(67, bootfile.into_bytes());
+        // Option 67: Bootfile Name (null-terminated for UEFI ROMs)
+        let mut opt67 = bootfile.into_bytes();
+        opt67.push(0);
+        reply.options.insert(67, opt67);
 
         Ok(Some(reply))
     }

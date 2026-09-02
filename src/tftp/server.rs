@@ -219,11 +219,16 @@ impl TftpServer {
         let mut block_num: u16 = 1;
         let mut offset = 0;
         let mut sent_bytes = 0u64;
+        let mut done = false;
 
-        while offset < file_len || (file_len == 0 && block_num == 1) {
+        while !done {
             let chunk_end = (offset + blksize).min(file_len);
             let chunk = file_bytes[offset..chunk_end].to_vec();
             let chunk_len = chunk.len();
+            if chunk_len < blksize {
+                done = true;
+            }
+
             let data_pkt = TftpPacket::Data {
                 block: block_num,
                 data: chunk,
@@ -261,7 +266,7 @@ impl TftpServer {
             self.state.record_tftp_bytes(chunk_len as u64);
 
             let percent = if file_len > 0 {
-                ((sent_bytes * 100) / file_len as u64) as u8
+                ((sent_bytes * 100) / file_len as u64).min(100) as u8
             } else {
                 100
             };
@@ -280,9 +285,6 @@ impl TftpServer {
             );
 
             block_num = block_num.wrapping_add(1);
-            if chunk_len < blksize {
-                break;
-            }
         }
 
         self.state.record_tftp_file();
@@ -298,11 +300,16 @@ impl TftpServer {
     }
 
     fn resolve_safe_path(&self, requested: &str) -> std::result::Result<PathBuf, TftpError> {
-        // Strip leading slashes and Windows-style paths
-        let clean_name = requested
+        // Strip URI query strings (anything after '?')
+        let base_requested = requested.split('?').next().unwrap_or(requested);
+
+        // Strip leading slashes, Windows-style paths, null bytes, and replacement chars
+        let clean_name = base_requested
             .trim_start_matches('/')
             .trim_start_matches('\\')
-            .replace('\\', "/");
+            .replace('\\', "/")
+            .trim_matches(|c: char| c.is_whitespace() || c == '\0' || c == '\u{fffd}')
+            .to_string();
 
         // Prevent traversal tricks
         if clean_name.contains("..") {
@@ -311,7 +318,34 @@ impl TftpServer {
             ));
         }
 
-        let full_path = self.tftp_dir.join(&clean_name);
+        let mut full_path = self.tftp_dir.join(&clean_name);
+        if !full_path.exists() {
+            // Check suffix stripped alternatives (.0 or 0)
+            if let Some(stripped) = clean_name.strip_suffix(".0").or_else(|| clean_name.strip_suffix('0')) {
+                let alt = self.tftp_dir.join(stripped);
+                if alt.exists() {
+                    full_path = alt;
+                }
+            }
+        }
+
+        // Secondary fallback: sanitize to pure ASCII graphic characters
+        if !full_path.exists() {
+            let filtered: String = clean_name
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '/' || *c == '_' || *c == '-')
+                .collect();
+            let alt = self.tftp_dir.join(&filtered);
+            if alt.exists() {
+                full_path = alt;
+            } else if let Some(stripped) = filtered.strip_suffix(".0").or_else(|| filtered.strip_suffix('0')) {
+                let alt2 = self.tftp_dir.join(stripped);
+                if alt2.exists() {
+                    full_path = alt2;
+                }
+            }
+        }
+
         if !full_path.exists() {
             return Err(TftpError::FileNotFound(clean_name));
         }
