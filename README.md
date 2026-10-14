@@ -104,6 +104,8 @@ The server exposes an HTTP API and interactive dashboard on TCP port 8080:
 - **Raw iPXE Script**: `http://127.0.0.1:8080/boot.ipxe`
 - **JSON Telemetry API**: `http://127.0.0.1:8080/api/status`
 
+The operations console source lives in `web/`. Vercel builds it as a read-only demo with simulated data, while `npm --prefix web run build:embedded` produces the same interface in live mode for the Rust binary. The macOS app build runs the embedded console build automatically.
+
 ### `GET /api/status` Response Example
 
 ```json

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use serde::Serialize;
@@ -131,13 +131,15 @@ impl SharedState {
         stage: BootStage,
     ) {
         if let Ok(mut lock) = self.clients.lock() {
-            let entry = lock.entry(mac.to_string()).or_insert_with(|| ClientSession {
-                mac: mac.to_string(),
-                ip,
-                arch: arch.unwrap_or("Unknown").to_string(),
-                stage: stage.clone(),
-                last_seen: Instant::now(),
-            });
+            let entry = lock
+                .entry(mac.to_string())
+                .or_insert_with(|| ClientSession {
+                    mac: mac.to_string(),
+                    ip,
+                    arch: arch.unwrap_or("Unknown").to_string(),
+                    stage: stage.clone(),
+                    last_seen: Instant::now(),
+                });
 
             if let Some(ip) = ip {
                 entry.ip = Some(ip);
@@ -147,6 +149,24 @@ impl SharedState {
             }
             entry.stage = stage;
             entry.last_seen = Instant::now();
+        }
+    }
+
+    pub fn remove_client(&self, id: &str) -> bool {
+        if let Ok(mut lock) = self.clients.lock() {
+            let initial_len = lock.len();
+            lock.retain(|key, client| {
+                key != id && client.ip.map(|ip| ip.to_string()) != Some(id.to_string())
+            });
+            lock.len() < initial_len
+        } else {
+            false
+        }
+    }
+
+    pub fn clear_clients(&self) {
+        if let Ok(mut lock) = self.clients.lock() {
+            lock.clear();
         }
     }
 
@@ -204,7 +224,9 @@ impl SharedState {
                 let stage_text = match &c.stage {
                     BootStage::Discovering => "Discovering (DHCP)".to_string(),
                     BootStage::Offered(ip) => format!("Offered ({ip})"),
-                    BootStage::TftpTransfer { file, percent } => format!("TFTP {file} ({percent}%)"),
+                    BootStage::TftpTransfer { file, percent } => {
+                        format!("TFTP {file} ({percent}%)")
+                    }
                     BootStage::HttpBoot(path) => format!("HTTP {path}"),
                     BootStage::Booted => "Booted".to_string(),
                 };

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "net", "sync", "time", "fs", "io-util", "signal"] }
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "net", "sync", "time", "fs", "io-util", "signal", "process"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
@@ -19,3 +19,4 @@ futures = "0.3"
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+rust-embed = { version = "8.13", features = ["debug-embed"] }
