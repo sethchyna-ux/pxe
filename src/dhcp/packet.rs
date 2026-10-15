@@ -244,6 +244,15 @@ impl DhcpPacket {
             let code = u16::from_be_bytes([val[0], val[1]]);
             return ClientArch::from_u16(code);
         }
+        // Fallback: parse Option 60 (Vendor Class Identifier: "PXEClient:Arch:xxxxx:...")
+        if let Some(code) = self.options.get(&60).and_then(|val| {
+            let s = std::str::from_utf8(val).ok()?;
+            let idx = s.find(":Arch:")?;
+            let arch_part = s.get(idx + 6..)?;
+            arch_part.get(..5)?.parse::<u16>().ok()
+        }) {
+            return ClientArch::from_u16(code);
+        }
         ClientArch::BiosX86
     }
 
@@ -252,7 +261,7 @@ impl DhcpPacket {
         if self
             .options
             .get(&77)
-            .is_some_and(|val| std::str::from_utf8(val).is_ok_and(|s| s.contains("iPXE")))
+            .is_some_and(|val| val.windows(4).any(|w| w == b"iPXE"))
         {
             return true;
         }

@@ -137,7 +137,7 @@ impl DhcpServer {
                 match dhcp_sock.recv_from(&mut buf).await {
                     Ok((len, src)) => {
                         this_main.state.record_dhcp_in();
-                        if let Err(e) = this_main.handle_packet(&dhcp_sock, &buf[..len], src).await {
+                        if let Err(e) = this_main.handle_packet(&dhcp_sock, &buf[..len], src, false).await {
                             this_main.state.record_error();
                             this_main.state.log(
                                 EventLevel::Warn,
@@ -167,7 +167,7 @@ impl DhcpServer {
                     match sock.recv_from(&mut buf).await {
                         Ok((len, src)) => {
                             this_proxy.state.record_dhcp_in();
-                            if let Err(e) = this_proxy.handle_packet(&sock, &buf[..len], src).await {
+                            if let Err(e) = this_proxy.handle_packet(&sock, &buf[..len], src, true).await {
                                 this_proxy.state.record_error();
                                 this_proxy.state.log(
                                     EventLevel::Warn,
@@ -204,6 +204,7 @@ impl DhcpServer {
         sock: &UdpSocket,
         buf: &[u8],
         src: SocketAddr,
+        is_proxy_port: bool,
     ) -> Result<()> {
         let packet = match DhcpPacket::parse(buf) {
             Ok(p) => p,
@@ -223,6 +224,11 @@ impl DhcpServer {
 
         match msg_type {
             DhcpMessageType::Discover => {
+                // Ignore Discover on ProxyDHCP port 4011 (Discover is only valid on port 67)
+                if is_proxy_port {
+                    return Ok(());
+                }
+
                 let arch_desc = arch.display_name();
                 let ipxe_suffix = if is_ipxe { " (iPXE Stage 2)" } else { "" };
                 self.state.log(
@@ -239,20 +245,36 @@ impl DhcpServer {
                 );
 
                 if let Some(reply) = self.build_offer(&packet, is_ipxe, arch)? {
-                    self.send_reply(sock, &reply, src).await?;
+                    self.send_reply(sock, &reply, src, is_proxy_port).await?;
                 }
             }
             DhcpMessageType::Request | DhcpMessageType::Inform => {
-                // Check if server identifier in request matches ours or is unassigned
-                let is_for_us = match packet.options.get(&54) {
-                    Some(s) if s.len() == 4 => {
-                        let req_server = Ipv4Addr::new(s[0], s[1], s[2], s[3]);
-                        req_server == self.server_ip
+                let req_server_opt = packet.options.get(&54).and_then(|s| {
+                    if s.len() == 4 {
+                        Some(Ipv4Addr::new(s[0], s[1], s[2], s[3]))
+                    } else {
+                        None
                     }
-                    _ => true,
+                });
+
+                // In Proxy mode on port 67, requests explicitly addressed to another DHCP server
+                // (e.g. the network router allocating IP) must NOT be answered by ProxyDHCP.
+                let should_respond = if is_proxy_port {
+                    true
+                } else {
+                    match req_server_opt {
+                        Some(req_server) => req_server == self.server_ip,
+                        None => {
+                            if self.mode == ServerMode::Proxy {
+                                packet.options.get(&60).is_some_and(|v| v.starts_with(b"PXEClient"))
+                            } else {
+                                true
+                            }
+                        }
+                    }
                 };
 
-                if is_for_us || self.mode == ServerMode::Proxy {
+                if should_respond {
                     let arch_desc = arch.display_name();
                     self.state.log(
                         EventLevel::Info,
@@ -261,7 +283,7 @@ impl DhcpServer {
                     );
 
                     if let Some(reply) = self.build_ack(&packet, is_ipxe, arch)? {
-                        self.send_reply(sock, &reply, src).await?;
+                        self.send_reply(sock, &reply, src, is_proxy_port).await?;
                     }
                 }
             }
@@ -271,7 +293,7 @@ impl DhcpServer {
         Ok(())
     }
 
-    fn build_offer(
+    pub(crate) fn build_offer(
         &self,
         req: &DhcpPacket,
         is_ipxe: bool,
@@ -336,8 +358,24 @@ impl DhcpServer {
             if let Some(uuid) = req.client_uuid() {
                 reply.options.insert(97, uuid);
             }
+
+            // Legacy BIOS Option 43 Construction with strict TLV sub-option lengths
+            if arch == ClientArch::BiosX86 {
+                let server_ip_bytes = self.server_ip.octets();
+                let opt43 = vec![
+                    // Sub-option 6: Discovery Control (value 8 = bypass menu and use bootfile)
+                    6, 1, 8,
+                    // Sub-option 8: PXE Boot Server IP (type 8, length 7, payload 0,0,1,<server_ip>)
+                    8, 7, 0, 0, 1, server_ip_bytes[0], server_ip_bytes[1], server_ip_bytes[2], server_ip_bytes[3],
+                    // Sub-option 9: PXE Boot Menu (Type 0, Length 6, "PXE")
+                    9, 6, 0, 0, 3, 80, 88, 69,
+                    // Sub-option 10: PXE Menu Prompt (Timeout 0, "PXE")
+                    10, 4, 0, 80, 88, 69,
+                ];
+                reply.options.insert(43, opt43);
+            }
         } else {
-            // Standalone mode options
+            // Standalone mode options (strictly isolated from ProxyDHCP)
             reply
                 .options
                 .insert(51, lease_time.to_be_bytes().to_vec());
@@ -348,9 +386,14 @@ impl DhcpServer {
             if let Some(r) = self.router {
                 reply.options.insert(3, r.octets().to_vec());
             }
+
+            // Standalone DNS Fallback: configured DNS + secondary fallback 8.4.4.1
+            let mut dns_bytes = Vec::new();
             if let Some(d) = self.dns {
-                reply.options.insert(6, d.octets().to_vec());
+                dns_bytes.extend_from_slice(&d.octets());
             }
+            dns_bytes.extend_from_slice(&Ipv4Addr::new(8, 4, 4, 1).octets());
+            reply.options.insert(6, dns_bytes);
         }
 
         // Option 66: TFTP Server Name / IP (null-terminated for UEFI ROMs)
@@ -373,7 +416,7 @@ impl DhcpServer {
         Ok(Some(reply))
     }
 
-    fn build_ack(
+    pub(crate) fn build_ack(
         &self,
         req: &DhcpPacket,
         is_ipxe: bool,
@@ -381,7 +424,8 @@ impl DhcpServer {
     ) -> Result<Option<DhcpPacket>> {
         let (yiaddr, lease_time): (Ipv4Addr, u32) = match self.mode {
             ServerMode::Proxy => {
-                (req.ciaddr, 0)
+                // In ProxyDHCP mode, yiaddr MUST always be 0.0.0.0
+                (Ipv4Addr::UNSPECIFIED, 0)
             }
             ServerMode::Standalone => {
                 let ip = self.allocate_ip(&req.mac_string())?;
@@ -430,6 +474,22 @@ impl DhcpServer {
             if let Some(uuid) = req.client_uuid() {
                 reply.options.insert(97, uuid);
             }
+
+            // Legacy BIOS Option 43 Construction with strict TLV sub-option lengths
+            if arch == ClientArch::BiosX86 {
+                let server_ip_bytes = self.server_ip.octets();
+                let opt43 = vec![
+                    // Sub-option 6: Discovery Control (value 8 = bypass menu and use bootfile)
+                    6, 1, 8,
+                    // Sub-option 8: PXE Boot Server IP (type 8, length 7, payload 0,0,1,<server_ip>)
+                    8, 7, 0, 0, 1, server_ip_bytes[0], server_ip_bytes[1], server_ip_bytes[2], server_ip_bytes[3],
+                    // Sub-option 9: PXE Boot Menu (Type 0, Length 6, "PXE")
+                    9, 6, 0, 0, 3, 80, 88, 69,
+                    // Sub-option 10: PXE Menu Prompt (Timeout 0, "PXE")
+                    10, 4, 0, 80, 88, 69,
+                ];
+                reply.options.insert(43, opt43);
+            }
         } else {
             reply
                 .options
@@ -440,9 +500,14 @@ impl DhcpServer {
             if let Some(r) = self.router {
                 reply.options.insert(3, r.octets().to_vec());
             }
+
+            // Standalone DNS Fallback: configured DNS + secondary fallback 8.4.4.1
+            let mut dns_bytes = Vec::new();
             if let Some(d) = self.dns {
-                reply.options.insert(6, d.octets().to_vec());
+                dns_bytes.extend_from_slice(&d.octets());
             }
+            dns_bytes.extend_from_slice(&Ipv4Addr::new(8, 4, 4, 1).octets());
+            reply.options.insert(6, dns_bytes);
         }
 
         // Option 66: TFTP Server Name (null-terminated for UEFI ROMs)
@@ -463,13 +528,14 @@ impl DhcpServer {
         sock: &UdpSocket,
         reply: &DhcpPacket,
         src: SocketAddr,
+        is_proxy_port: bool,
     ) -> Result<()> {
         let bytes = reply.serialize();
 
-        // Determine destination: broadcast 255.255.255.255:68 or specific client port
-        let target_dest = if src.ip().is_unspecified() || reply.flags & 0x8000 != 0 {
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, 68))
-        } else if src.port() == self.proxy_port {
+        // Destination routing:
+        // Direct unicast back to the requesting client on ProxyDHCP port (4011)
+        // Standard DHCP broadcast to 255.255.255.255:68 on port 67
+        let target_dest = if is_proxy_port {
             src
         } else {
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, 68))
