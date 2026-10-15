@@ -10,6 +10,7 @@ item --gap --             ---------------- Linux Distributions ----------------
 item ubuntu               Ubuntu 24.04 LTS Live Server
 item mint                 Linux Mint 22 (Cinnamon 64-bit)
 item arch                 Arch Linux (Latest Rolling Netboot)
+item debian               Debian 12 Bookworm (Netboot Installer)
 item fedora               Fedora 44 Server (Netinstall)
 item solus                Solus Budgie Desktop (Live ISO)
 item alpine               Alpine Linux (Fast RAM Boot ~20MB)
@@ -55,6 +56,15 @@ initrd ${base_url}/arch/initramfs-linux.img
 boot || goto failed
 
 # -----------------------------------------------------------------------------
+# Debian 12 Bookworm (Netboot Installer)
+# -----------------------------------------------------------------------------
+:debian
+echo Booting Debian 12 Bookworm Installer from ${base_url}...
+kernel ${base_url}/debian/linux initrd=initrd.gz ip=dhcp --- quiet
+initrd ${base_url}/debian/initrd.gz
+boot || goto failed
+
+# -----------------------------------------------------------------------------
 # Fedora 44 Server
 # -----------------------------------------------------------------------------
 :fedora
@@ -84,7 +94,7 @@ boot || goto failed
 # -----------------------------------------------------------------------------
 :memtest
 echo Loading Memtest86+...
-kernel ${base_url}/tools/memtest.bin
+iseq ${platform} efi && chain ${base_url}/tools/memtest.efi || kernel ${base_url}/tools/memtest.bin
 boot || goto failed
 
 :netboot_xyz
