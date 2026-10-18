@@ -3,6 +3,7 @@ pub mod dhcp;
 pub mod error;
 pub mod http;
 pub mod init;
+pub mod sim;
 pub mod state;
 pub mod tftp;
 pub mod ui;
@@ -182,5 +183,28 @@ mod tests {
         assert!(script.contains("item alpine"));
         assert!(script.contains("item ubuntu"));
         assert!(script.contains("item netboot_xyz"));
+    }
+
+    #[tokio::test]
+    async fn test_asus_z97a_full_pxe_simulation() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let tftp_dir = manifest_dir.join("tftpboot");
+        let http_dir = manifest_dir.join("httpboot");
+
+        let reports = sim::run_z97a_simulation_suite(&tftp_dir, &http_dir)
+            .await
+            .expect("ASUS Z97-A simulation suite must run without error");
+
+        assert_eq!(reports.len(), 3);
+        for report in &reports {
+            for step in &report.steps {
+                assert!(
+                    step.passed,
+                    "Scenario '{}' failed at step '{}': {}",
+                    report.scenario, step.step, step.detail
+                );
+            }
+            assert!(report.passed);
+        }
     }
 }

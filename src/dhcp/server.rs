@@ -55,7 +55,7 @@ impl DhcpServer {
         }
     }
 
-    fn create_udp_socket(port: u16) -> std::io::Result<UdpSocket> {
+    fn create_udp_socket(port: u16, _server_ip: Ipv4Addr) -> std::io::Result<UdpSocket> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(SocketProto::UDP))?;
         socket.set_broadcast(true)?;
         socket.set_reuse_address(true)?;
@@ -71,6 +71,30 @@ impl DhcpServer {
                 std::mem::size_of_val(&optval) as libc::socklen_t,
             );
         }
+        #[cfg(target_os = "macos")]
+        if !_server_ip.is_loopback() && !_server_ip.is_unspecified() {
+            for (if_name, ip) in crate::config::list_network_interfaces() {
+                if ip == _server_ip {
+                    if let Ok(c_name) = std::ffi::CString::new(if_name) {
+                        unsafe {
+                            use std::os::fd::AsRawFd;
+                            let idx = libc::if_nametoindex(c_name.as_ptr());
+                            if idx != 0 {
+                                const IP_BOUND_IF: libc::c_int = 25;
+                                libc::setsockopt(
+                                    socket.as_raw_fd(),
+                                    libc::IPPROTO_IP,
+                                    IP_BOUND_IF,
+                                    &idx as *const _ as *const libc::c_void,
+                                    std::mem::size_of_val(&idx) as libc::socklen_t,
+                                );
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
         socket.set_nonblocking(true)?;
 
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
@@ -81,9 +105,10 @@ impl DhcpServer {
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        let dhcp_sock = match Self::create_udp_socket(self.dhcp_port) {
+        let dhcp_sock = match Self::create_udp_socket(self.dhcp_port, self.server_ip) {
             Ok(s) => s,
             Err(e) => {
+                #[allow(unused_mut)]
                 let mut msg = format!(
                     "Failed to bind DHCP port {}: {e}",
                     self.dhcp_port
@@ -108,7 +133,7 @@ impl DhcpServer {
 
         // Optional secondary socket for ProxyDHCP port (4011) if in proxy mode
         let proxy_sock = if self.mode == ServerMode::Proxy && self.proxy_port != self.dhcp_port {
-            match Self::create_udp_socket(self.proxy_port) {
+            match Self::create_udp_socket(self.proxy_port, self.server_ip) {
                 Ok(s) => {
                     self.state.log(
                         EventLevel::Success,
@@ -137,7 +162,7 @@ impl DhcpServer {
                 match dhcp_sock.recv_from(&mut buf).await {
                     Ok((len, src)) => {
                         this_main.state.record_dhcp_in();
-                        if let Err(e) = this_main.handle_packet(&dhcp_sock, &buf[..len], src).await {
+                        if let Err(e) = this_main.handle_packet(&dhcp_sock, &buf[..len], src, false).await {
                             this_main.state.record_error();
                             this_main.state.log(
                                 EventLevel::Warn,
@@ -167,7 +192,7 @@ impl DhcpServer {
                     match sock.recv_from(&mut buf).await {
                         Ok((len, src)) => {
                             this_proxy.state.record_dhcp_in();
-                            if let Err(e) = this_proxy.handle_packet(&sock, &buf[..len], src).await {
+                            if let Err(e) = this_proxy.handle_packet(&sock, &buf[..len], src, true).await {
                                 this_proxy.state.record_error();
                                 this_proxy.state.log(
                                     EventLevel::Warn,
@@ -204,6 +229,7 @@ impl DhcpServer {
         sock: &UdpSocket,
         buf: &[u8],
         src: SocketAddr,
+        is_proxy_port: bool,
     ) -> Result<()> {
         let packet = match DhcpPacket::parse(buf) {
             Ok(p) => p,
@@ -221,6 +247,20 @@ impl DhcpServer {
         let arch = packet.client_arch();
         let is_ipxe = packet.is_ipxe();
 
+        let observed_ip = if !packet.ciaddr.is_unspecified() {
+            Some(packet.ciaddr)
+        } else if let Some(req_ip) = packet.requested_ip() {
+            Some(req_ip)
+        } else if let SocketAddr::V4(v4) = src {
+            if !v4.ip().is_unspecified() && !v4.ip().is_broadcast() {
+                Some(*v4.ip())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         match msg_type {
             DhcpMessageType::Discover => {
                 let arch_desc = arch.display_name();
@@ -233,13 +273,13 @@ impl DhcpServer {
 
                 self.state.update_client(
                     &mac,
-                    None,
+                    observed_ip,
                     Some(arch.display_name()),
                     BootStage::Discovering,
                 );
 
-                if let Some(reply) = self.build_offer(&packet, is_ipxe, arch)? {
-                    self.send_reply(sock, &reply, src).await?;
+                if let Some(reply) = self.build_offer(&packet, is_ipxe, arch, observed_ip)? {
+                    self.send_reply(sock, &reply, src, is_proxy_port).await?;
                 }
             }
             DhcpMessageType::Request | DhcpMessageType::Inform => {
@@ -254,14 +294,15 @@ impl DhcpServer {
 
                 if is_for_us || self.mode == ServerMode::Proxy {
                     let arch_desc = arch.display_name();
+                    let port_tag = if is_proxy_port { " (ProxyDHCP :4011)" } else { "" };
                     self.state.log(
                         EventLevel::Info,
                         Protocol::Dhcp,
-                        format!("DHCPREQUEST from {mac} [{arch_desc}]"),
+                        format!("DHCPREQUEST from {mac} [{arch_desc}{port_tag}]"),
                     );
 
-                    if let Some(reply) = self.build_ack(&packet, is_ipxe, arch)? {
-                        self.send_reply(sock, &reply, src).await?;
+                    if let Some(reply) = self.build_ack(&packet, is_ipxe, arch, observed_ip)? {
+                        self.send_reply(sock, &reply, src, is_proxy_port).await?;
                     }
                 }
             }
@@ -271,11 +312,50 @@ impl DhcpServer {
         Ok(())
     }
 
+    fn populate_boot_fields(&self, reply: &mut DhcpPacket, bootfile: &str) {
+        // Populate 64-byte server host name (sname) with server IP string
+        let sname_str = self.server_ip.to_string();
+        let sname_bytes = sname_str.as_bytes();
+        let sname_len = sname_bytes.len().min(63);
+        reply.sname[..sname_len].copy_from_slice(&sname_bytes[..sname_len]);
+
+        // Populate 128-byte bootfile field in fixed header
+        let bootfile_bytes = bootfile.as_bytes();
+        let copy_len = bootfile_bytes.len().min(127);
+        reply.file[..copy_len].copy_from_slice(&bootfile_bytes[..copy_len]);
+
+        // Option 66: TFTP Server Name / IP (RFC 2132 length-delimited string, no trailing null inside TLV)
+        reply
+            .options
+            .insert(66, sname_str.into_bytes());
+
+        // Option 67: Bootfile Name (no trailing null inside TLV so iPXE HTTP URLs & strict UEFI parsers succeed)
+        reply
+            .options
+            .insert(67, bootfile.as_bytes().to_vec());
+    }
+
+    fn populate_pxe_vendor_options(&self, req: &DhcpPacket, reply: &mut DhcpPacket) {
+        // Option 60: Vendor Class Identifier = "PXEClient" (Essential for ProxyDHCP & Intel Boot Agent / UEFI PXE)
+        reply.options.insert(60, b"PXEClient".to_vec());
+
+        // Option 43: Vendor-Specific Information -> PXE_DISCOVERY_CONTROL (Sub-option 6 = 8)
+        // Bit 3 (0x08): Disable broadcast/multicast bootserver discovery and use bootfile from DHCP/ProxyDHCP packet directly.
+        // Required by Intel I218-V Boot Agent GE & AMI Aptio IV UEFI PXE on ASUS Z97-A.
+        reply.options.insert(43, vec![6, 1, 8, 255]);
+
+        // Echo client machine UUID (Option 97)
+        if let Some(uuid) = req.client_uuid() {
+            reply.options.insert(97, uuid);
+        }
+    }
+
     fn build_offer(
         &self,
         req: &DhcpPacket,
         is_ipxe: bool,
         arch: ClientArch,
+        observed_ip: Option<Ipv4Addr>,
     ) -> Result<Option<DhcpPacket>> {
         let (yiaddr, lease_time): (Ipv4Addr, u32) = match self.mode {
             ServerMode::Proxy => {
@@ -313,10 +393,7 @@ impl DhcpServer {
             arch.default_bootfile().to_string()
         };
 
-        // Copy bootfile into 'file' field
-        let bootfile_bytes = bootfile.as_bytes();
-        let copy_len = bootfile_bytes.len().min(127);
-        reply.file[..copy_len].copy_from_slice(&bootfile_bytes[..copy_len]);
+        self.populate_boot_fields(&mut reply, &bootfile);
 
         // Option 53: DHCP Offer
         reply.options.insert(53, vec![DhcpMessageType::Offer as u8]);
@@ -327,15 +404,7 @@ impl DhcpServer {
             .insert(54, self.server_ip.octets().to_vec());
 
         if self.mode == ServerMode::Proxy {
-            // Option 60: Vendor Class Identifier = "PXEClient" (Essential for ProxyDHCP!)
-            reply
-                .options
-                .insert(60, b"PXEClient".to_vec());
-
-            // Echo client machine UUID (Option 97)
-            if let Some(uuid) = req.client_uuid() {
-                reply.options.insert(97, uuid);
-            }
+            self.populate_pxe_vendor_options(req, &mut reply);
         } else {
             // Standalone mode options
             reply
@@ -351,23 +420,22 @@ impl DhcpServer {
             if let Some(d) = self.dns {
                 reply.options.insert(6, d.octets().to_vec());
             }
+            if let Some(uuid) = req.client_uuid() {
+                reply.options.insert(97, uuid);
+            }
         }
 
-        // Option 66: TFTP Server Name / IP (null-terminated for UEFI ROMs)
-        let mut opt66 = self.server_ip.to_string().into_bytes();
-        opt66.push(0);
-        reply.options.insert(66, opt66);
-
-        // Option 67: Bootfile Name (null-terminated for UEFI ROMs)
-        let mut opt67 = bootfile.into_bytes();
-        opt67.push(0);
-        reply.options.insert(67, opt67);
+        let tracked_ip = if !yiaddr.is_unspecified() {
+            Some(yiaddr)
+        } else {
+            observed_ip
+        };
 
         self.state.update_client(
             &req.mac_string(),
-            if yiaddr.is_unspecified() { None } else { Some(yiaddr) },
+            tracked_ip,
             Some(arch.display_name()),
-            BootStage::Offered(yiaddr),
+            BootStage::Offered(tracked_ip.unwrap_or(yiaddr)),
         );
 
         Ok(Some(reply))
@@ -378,6 +446,7 @@ impl DhcpServer {
         req: &DhcpPacket,
         is_ipxe: bool,
         arch: ClientArch,
+        observed_ip: Option<Ipv4Addr>,
     ) -> Result<Option<DhcpPacket>> {
         let (yiaddr, lease_time): (Ipv4Addr, u32) = match self.mode {
             ServerMode::Proxy => {
@@ -413,9 +482,7 @@ impl DhcpServer {
             arch.default_bootfile().to_string()
         };
 
-        let bootfile_bytes = bootfile.as_bytes();
-        let copy_len = bootfile_bytes.len().min(127);
-        reply.file[..copy_len].copy_from_slice(&bootfile_bytes[..copy_len]);
+        self.populate_boot_fields(&mut reply, &bootfile);
 
         // Option 53: DHCP ACK
         reply.options.insert(53, vec![DhcpMessageType::Ack as u8]);
@@ -426,10 +493,7 @@ impl DhcpServer {
             .insert(54, self.server_ip.octets().to_vec());
 
         if self.mode == ServerMode::Proxy {
-            reply.options.insert(60, b"PXEClient".to_vec());
-            if let Some(uuid) = req.client_uuid() {
-                reply.options.insert(97, uuid);
-            }
+            self.populate_pxe_vendor_options(req, &mut reply);
         } else {
             reply
                 .options
@@ -443,17 +507,23 @@ impl DhcpServer {
             if let Some(d) = self.dns {
                 reply.options.insert(6, d.octets().to_vec());
             }
+            if let Some(uuid) = req.client_uuid() {
+                reply.options.insert(97, uuid);
+            }
         }
 
-        // Option 66: TFTP Server Name (null-terminated for UEFI ROMs)
-        let mut opt66 = self.server_ip.to_string().into_bytes();
-        opt66.push(0);
-        reply.options.insert(66, opt66);
+        let tracked_ip = if !yiaddr.is_unspecified() {
+            Some(yiaddr)
+        } else {
+            observed_ip
+        };
 
-        // Option 67: Bootfile Name (null-terminated for UEFI ROMs)
-        let mut opt67 = bootfile.into_bytes();
-        opt67.push(0);
-        reply.options.insert(67, opt67);
+        self.state.update_client(
+            &req.mac_string(),
+            tracked_ip,
+            Some(arch.display_name()),
+            BootStage::Offered(tracked_ip.unwrap_or(yiaddr)),
+        );
 
         Ok(Some(reply))
     }
@@ -463,20 +533,52 @@ impl DhcpServer {
         sock: &UdpSocket,
         reply: &DhcpPacket,
         src: SocketAddr,
+        is_proxy_port: bool,
     ) -> Result<()> {
         let bytes = reply.serialize();
 
-        // Determine destination: broadcast 255.255.255.255:68 or specific client port
-        let target_dest = if src.ip().is_unspecified() || reply.flags & 0x8000 != 0 {
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, 68))
-        } else if src.port() == self.proxy_port {
+        // Determine destination:
+        // 1. ProxyDHCP port (4011) or non-standard port simulation: reply directly to unicast peer if IP is known
+        // 2. Unicast request (broadcast bit 0x8000 clear and valid client IP): reply directly to src
+        // 3. Broadcast request on standard DHCP port 67: send to 255.255.255.255:68
+        let target_dest = if is_proxy_port && !src.ip().is_unspecified() {
             src
+        } else if !src.ip().is_unspecified() && (reply.flags & 0x8000 == 0 || self.dhcp_port != 67) {
+            src
+        } else if !reply.ciaddr.is_unspecified() && reply.flags & 0x8000 == 0 {
+            SocketAddr::V4(SocketAddrV4::new(reply.ciaddr, 68))
         } else {
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, 68))
         };
 
-        match sock.send_to(&bytes, target_dest).await {
-            Ok(_) => {
+        let subnet_bcast = Ipv4Addr::from(u32::from(self.server_ip) | !u32::from(self.subnet_mask));
+        let subnet_dest = SocketAddr::V4(SocketAddrV4::new(subnet_bcast, 68));
+
+        let send_res = match sock.send_to(&bytes, target_dest).await {
+            Ok(n) => {
+                // On multi-homed hosts (e.g. Mac with Wi-Fi + USB Ethernet, or Linux with wlan0 + eno1),
+                // also transmit to subnet-directed broadcast (e.g. 192.168.1.255:68) so the kernel
+                // routes the packet out the exact subnet interface even if 255.255.255.255 went to default route.
+                if target_dest.ip() == Ipv4Addr::BROADCAST
+                    && !self.server_ip.is_loopback()
+                    && subnet_bcast != Ipv4Addr::BROADCAST
+                {
+                    let _ = sock.send_to(&bytes, subnet_dest).await;
+                }
+                Ok((n, target_dest))
+            }
+            Err(e) if target_dest.ip() == Ipv4Addr::BROADCAST && subnet_bcast != Ipv4Addr::BROADCAST => {
+                // Offline direct-cable fallback when 255.255.255.255 returns EHOSTUNREACH / ENETUNREACH
+                sock.send_to(&bytes, subnet_dest)
+                    .await
+                    .map(|n| (n, subnet_dest))
+                    .map_err(|_| e)
+            }
+            Err(e) => Err(e),
+        };
+
+        match send_res {
+            Ok((_, actual_dest)) => {
                 self.state.record_dhcp_out();
                 let mac = reply.mac_string();
                 let msg_name = match reply.message_type() {
@@ -487,7 +589,7 @@ impl DhcpServer {
                 self.state.log(
                     EventLevel::Success,
                     Protocol::Dhcp,
-                    format!("Sent {msg_name} to {mac} via {target_dest}"),
+                    format!("Sent {msg_name} to {mac} via {actual_dest}"),
                 );
                 Ok(())
             }

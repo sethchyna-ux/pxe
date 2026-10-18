@@ -239,12 +239,36 @@ impl DhcpPacket {
     }
 
     pub fn client_arch(&self) -> ClientArch {
-        // Option 93 (Client System Architecture)
+        // 1. Check Option 93 (Client System Architecture)
         if let Some(val) = self.options.get(&93).filter(|v| v.len() >= 2) {
             let code = u16::from_be_bytes([val[0], val[1]]);
             return ClientArch::from_u16(code);
         }
+        // 2. Fallback: Parse Option 60 Vendor Class Identifier ("PXEClient:Arch:00007:UNDI:003016")
+        if let Some(vc) = self.vendor_class() {
+            if let Some(arch_idx) = vc.find("Arch:") {
+                let rest = &vc[arch_idx + 5..];
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(code) = digits.parse::<u16>() {
+                    return ClientArch::from_u16(code);
+                }
+            }
+        }
         ClientArch::BiosX86
+    }
+
+    pub fn vendor_class(&self) -> Option<String> {
+        self.options
+            .get(&60)
+            .and_then(|v| std::str::from_utf8(v).ok())
+            .map(|s| s.trim_end_matches('\0').to_string())
+    }
+
+    pub fn requested_ip(&self) -> Option<Ipv4Addr> {
+        self.options
+            .get(&50)
+            .filter(|v| v.len() == 4)
+            .map(|v| Ipv4Addr::new(v[0], v[1], v[2], v[3]))
     }
 
     pub fn is_ipxe(&self) -> bool {

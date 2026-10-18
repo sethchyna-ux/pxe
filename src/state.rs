@@ -125,14 +125,40 @@ impl SharedState {
 
     pub fn update_client(
         &self,
-        mac: &str,
+        mac_or_ip: &str,
         ip: Option<Ipv4Addr>,
         arch: Option<&str>,
         stage: BootStage,
     ) {
         if let Ok(mut lock) = self.clients.lock() {
-            let entry = lock.entry(mac.to_string()).or_insert_with(|| ClientSession {
-                mac: mac.to_string(),
+            // If caller passed an IP string (from TFTP/HTTP) rather than a MAC, try to match an existing MAC session
+            let resolved_key = if !mac_or_ip.contains(':') {
+                if let Some(target_ip) = ip {
+                    lock.iter()
+                        .find(|(_, c)| c.ip == Some(target_ip))
+                        .map(|(k, _)| k.clone())
+                        .or_else(|| {
+                            // In ProxyDHCP or loopback simulation, bind to most recent MAC session
+                            lock.iter()
+                                .filter(|(k, c)| {
+                                    k.contains(':')
+                                        && (c.ip.is_none()
+                                            || c.ip == Some(Ipv4Addr::UNSPECIFIED)
+                                            || target_ip.is_loopback())
+                                })
+                                .max_by_key(|(_, c)| c.last_seen)
+                                .map(|(k, _)| k.clone())
+                        })
+                        .unwrap_or_else(|| mac_or_ip.to_string())
+                } else {
+                    mac_or_ip.to_string()
+                }
+            } else {
+                mac_or_ip.to_string()
+            };
+
+            let entry = lock.entry(resolved_key).or_insert_with(|| ClientSession {
+                mac: mac_or_ip.to_string(),
                 ip,
                 arch: arch.unwrap_or("Unknown").to_string(),
                 stage: stage.clone(),
@@ -140,7 +166,9 @@ impl SharedState {
             });
 
             if let Some(ip) = ip {
-                entry.ip = Some(ip);
+                if !ip.is_unspecified() || entry.ip.is_none() {
+                    entry.ip = Some(ip);
+                }
             }
             if let Some(arch) = arch {
                 entry.arch = arch.to_string();

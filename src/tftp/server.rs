@@ -14,6 +14,8 @@ pub struct TftpServer {
     state: Arc<SharedState>,
     tftp_dir: PathBuf,
     port: u16,
+    server_ip: Option<Ipv4Addr>,
+    http_port: u16,
 }
 
 impl TftpServer {
@@ -22,7 +24,15 @@ impl TftpServer {
             state,
             tftp_dir,
             port,
+            server_ip: None,
+            http_port: 8080,
         }
+    }
+
+    pub fn with_http_context(mut self, server_ip: Ipv4Addr, http_port: u16) -> Self {
+        self.server_ip = Some(server_ip);
+        self.http_port = http_port;
+        self
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -136,7 +146,7 @@ impl TftpServer {
             }
         };
 
-        let file_bytes = match tokio::fs::read(&file_path).await {
+        let mut file_bytes = match tokio::fs::read(&file_path).await {
             Ok(b) => b,
             Err(e) => {
                 let err_pkt = TftpPacket::build_error(ERR_NOT_FOUND, "File read error");
@@ -146,6 +156,16 @@ impl TftpServer {
                 return Err(TftpError::Io(e).into());
             }
         };
+
+        // Dynamically interpolate ${server_ip} and ${http_port} in .ipxe scripts served over TFTP
+        if file_path.extension().and_then(|s| s.to_str()) == Some("ipxe") {
+            if let (Some(srv_ip), Ok(text)) = (self.server_ip, std::str::from_utf8(&file_bytes)) {
+                file_bytes = text
+                    .replace("${server_ip}", &srv_ip.to_string())
+                    .replace("${http_port}", &self.http_port.to_string())
+                    .into_bytes();
+            }
+        }
 
         let file_len = file_bytes.len();
         self.state.log(
@@ -193,11 +213,25 @@ impl TftpServer {
             let mut retries = 0;
             loop {
                 match tokio::time::timeout(timeout_dur, ephemeral_sock.recv_from(&mut ack_buf)).await {
-                    Ok(Ok((len, _from))) => {
-                        if let Ok(TftpPacket::Ack { block: 0 }) = TftpPacket::parse(&ack_buf[..len]) {
+                    Ok(Ok((len, _from))) => match TftpPacket::parse(&ack_buf[..len]) {
+                        Ok(TftpPacket::Ack { block: 0 }) => {
                             break;
                         }
-                    }
+                        Ok(TftpPacket::Error { .. }) => {
+                            // UEFI MTFTP GetFileSize probe (e.g. ASUS Z97-A AMI Aptio IV UEFI PXE):
+                            // Client requests tsize=0, reads tsize from OACK, and immediately aborts
+                            // with ERROR before opening a second RRQ to download the binary.
+                            self.state.log(
+                                EventLevel::Info,
+                                Protocol::Tftp,
+                                format!(
+                                    "UEFI tsize probe completed for '{filename}' ({file_len} bytes) -> {client_addr}"
+                                ),
+                            );
+                            return Ok(());
+                        }
+                        _ => {}
+                    },
                     _ => {
                         retries += 1;
                         if retries >= 3 {
@@ -342,6 +376,21 @@ impl TftpServer {
                 let alt2 = self.tftp_dir.join(stripped);
                 if alt2.exists() {
                     full_path = alt2;
+                }
+            }
+        }
+
+        if !full_path.exists() {
+            // Case-insensitive fallback (e.g. BOOTX64.EFI -> bootx64.efi or IPXE.EFI -> ipxe.efi)
+            if let (Some(parent), Some(fname)) = (full_path.parent(), full_path.file_name()) {
+                let target_lower = fname.to_string_lossy().to_lowercase();
+                if let Ok(entries) = std::fs::read_dir(parent) {
+                    for entry in entries.flatten() {
+                        if entry.file_name().to_string_lossy().to_lowercase() == target_lower {
+                            full_path = entry.path();
+                            break;
+                        }
+                    }
                 }
             }
         }
