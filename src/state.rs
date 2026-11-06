@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use serde::Serialize;
@@ -131,39 +131,6 @@ impl SharedState {
         stage: BootStage,
     ) {
         if let Ok(mut lock) = self.clients.lock() {
-            // If caller passed an IP string (from TFTP/HTTP) rather than a MAC, try to match an existing MAC session
-            let resolved_key = if !mac_or_ip.contains(':') {
-                if let Some(target_ip) = ip {
-                    lock.iter()
-                        .find(|(_, c)| c.ip == Some(target_ip))
-                        .map(|(k, _)| k.clone())
-                        .or_else(|| {
-                            // In ProxyDHCP or loopback simulation, bind to most recent MAC session
-                            lock.iter()
-                                .filter(|(k, c)| {
-                                    k.contains(':')
-                                        && (c.ip.is_none()
-                                            || c.ip == Some(Ipv4Addr::UNSPECIFIED)
-                                            || target_ip.is_loopback())
-                                })
-                                .max_by_key(|(_, c)| c.last_seen)
-                                .map(|(k, _)| k.clone())
-                        })
-                        .unwrap_or_else(|| mac_or_ip.to_string())
-                } else {
-                    mac_or_ip.to_string()
-                }
-            } else {
-                mac_or_ip.to_string()
-            };
-
-            let entry = lock.entry(resolved_key).or_insert_with(|| ClientSession {
-                mac: mac_or_ip.to_string(),
-                ip,
-                arch: arch.unwrap_or("Unknown").to_string(),
-                stage: stage.clone(),
-                last_seen: Instant::now(),
-            });
 
             if let Some(ip) = ip {
                 if !ip.is_unspecified() || entry.ip.is_none() {
@@ -175,6 +142,24 @@ impl SharedState {
             }
             entry.stage = stage;
             entry.last_seen = Instant::now();
+        }
+    }
+
+    pub fn remove_client(&self, id: &str) -> bool {
+        if let Ok(mut lock) = self.clients.lock() {
+            let initial_len = lock.len();
+            lock.retain(|key, client| {
+                key != id && client.ip.map(|ip| ip.to_string()) != Some(id.to_string())
+            });
+            lock.len() < initial_len
+        } else {
+            false
+        }
+    }
+
+    pub fn clear_clients(&self) {
+        if let Ok(mut lock) = self.clients.lock() {
+            lock.clear();
         }
     }
 
@@ -232,7 +217,9 @@ impl SharedState {
                 let stage_text = match &c.stage {
                     BootStage::Discovering => "Discovering (DHCP)".to_string(),
                     BootStage::Offered(ip) => format!("Offered ({ip})"),
-                    BootStage::TftpTransfer { file, percent } => format!("TFTP {file} ({percent}%)"),
+                    BootStage::TftpTransfer { file, percent } => {
+                        format!("TFTP {file} ({percent}%)")
+                    }
                     BootStage::HttpBoot(path) => format!("HTTP {path}"),
                     BootStage::Booted => "Booted".to_string(),
                 };

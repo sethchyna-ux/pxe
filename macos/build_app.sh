@@ -4,10 +4,14 @@ set -e
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 
-echo "==> [1/5] Compiling Rust release binary..."
+echo "==> [1/6] Building embedded PXE operations console..."
+npm --prefix "$PROJECT_DIR/web" ci
+npm --prefix "$PROJECT_DIR/web" run build:embedded
+
+echo "==> [2/6] Compiling Rust release binary..."
 cargo build --release
 
-echo "==> [2/5] Rendering macOS App Icon..."
+echo "==> [3/6] Rendering macOS App Icon..."
 ICONSET_DIR="/tmp/AppIcon.iconset"
 rm -rf "$ICONSET_DIR" /tmp/AppIcon.png /tmp/AppIcon.icns
 mkdir -p "$ICONSET_DIR"
@@ -29,10 +33,10 @@ sips -z 1024 1024 /tmp/AppIcon.png --out "$ICONSET_DIR/icon_512x512@2x.png" > /d
 iconutil -c icns "$ICONSET_DIR" -o /tmp/AppIcon.icns
 rm -rf "$ICONSET_DIR" /tmp/AppIcon.png
 
-echo "==> [3/5] Compiling Swift Native App..."
+echo "==> [4/6] Compiling Swift Native App..."
 swiftc -O -framework Cocoa -framework WebKit "$PROJECT_DIR/macos/AppDelegate.swift" -o /tmp/PXE_Server_Bin
 
-echo "==> [4/5] Constructing PXE Server.app bundle..."
+echo "==> [5/6] Constructing PXE Server.app bundle..."
 APP_DIR="$PROJECT_DIR/PXE Server.app"
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS"
@@ -78,7 +82,7 @@ cat << 'EOF' > "$APP_DIR/Contents/Info.plist"
 </plist>
 EOF
 
-echo "==> [5/5] Deploying app shortcuts..."
+echo "==> [6/6] Deploying app shortcuts..."
 # Make accessible in Applications or user's Desktop
 ln -sf "$APP_DIR" ~/Desktop/ 2>/dev/null || true
 mkdir -p ~/Applications
