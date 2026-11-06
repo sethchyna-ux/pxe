@@ -67,39 +67,66 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigati
         retryTimer = nil
     }
 
-    func startDaemonInBackground() {
-        // Check if port 8080 is already alive
-        guard let checkUrl = URL(string: "http://127.0.0.1:8080/api/status") else { return }
-        var req = URLRequest(url: checkUrl)
-        req.timeoutInterval = 0.8
+    func startDaemonInBackground(mode: String = "proxy", forceRestart: Bool = false) {
+        if !forceRestart {
+            guard let checkUrl = URL(string: "http://127.0.0.1:8080/api/status") else { return }
+            var req = URLRequest(url: checkUrl)
+            req.timeoutInterval = 0.8
 
-        URLSession.shared.dataTask(with: req) { _, resp, _ in
-            if let http = resp as? HTTPURLResponse, http.statusCode == 200 {
-                return // Server is already alive and running!
+            URLSession.shared.dataTask(with: req) { [weak self] _, resp, _ in
+                if let http = resp as? HTTPURLResponse, http.statusCode == 200 {
+                    return // Server is already alive and running!
+                }
+                self?.launchPrivilegedDaemon(mode: mode)
+            }.resume()
+        } else {
+            launchPrivilegedDaemon(mode: mode)
+        }
+    }
+
+    func launchPrivilegedDaemon(mode: String) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let bundlePath = Bundle.main.bundlePath
+            let bundleParent = (bundlePath as NSString).deletingLastPathComponent
+            var pxeBin = (bundlePath as NSString).appendingPathComponent("Contents/MacOS/pxe")
+            if !FileManager.default.fileExists(atPath: pxeBin) {
+                let devPath = (NSHomeDirectory() as NSString).appendingPathComponent("pxe/target/release/pxe")
+                pxeBin = FileManager.default.fileExists(atPath: devPath) ? devPath : "/usr/local/bin/pxe"
             }
 
-            // Launch daemon with admin privileges on background thread
-            DispatchQueue.global(qos: .userInitiated).async {
-                let bundlePath = Bundle.main.bundlePath
-                var pxeBin = (bundlePath as NSString).appendingPathComponent("Contents/MacOS/pxe")
-                if !FileManager.default.fileExists(atPath: pxeBin) {
-                    let devPath = "/Users/yocan/pxe/target/release/pxe"
-                    pxeBin = FileManager.default.fileExists(atPath: devPath) ? devPath : "/usr/local/bin/pxe"
-                }
-
-                let pxeDir = "/Users/yocan/pxe"
-                let cmd = "killall -9 pxe 2>/dev/null || true; cd '\(pxeDir)' && '\(pxeBin)' serve --mode standalone --dhcp-range 192.168.1.200,192.168.1.240 --dhcp-router 192.168.1.1 --dhcp-dns 1.1.1.1 --no-tui"
-                let script = "do shell script \"\(cmd) > /tmp/pxe_app.log 2>&1 &\" with administrator privileges"
-
-                var error: NSDictionary?
-                if let appleScript = NSAppleScript(source: script) {
-                    appleScript.executeAndReturnError(&error)
-                    if let err = error {
-                        print("Admin authorization notice: \(err)")
-                    }
+            let candidateDirs = [
+                bundleParent,
+                (NSHomeDirectory() as NSString).appendingPathComponent("pxe"),
+                "/Users/yocan/pxe"
+            ]
+            var pxeDir = "/Users/yocan/pxe"
+            for dir in candidateDirs {
+                let tftpCheck = (dir as NSString).appendingPathComponent("tftpboot")
+                if FileManager.default.fileExists(atPath: tftpCheck) {
+                    pxeDir = dir
+                    break
                 }
             }
-        }.resume()
+
+            let modeArgs: String
+            if mode == "standalone" {
+                modeArgs = "--mode standalone --dhcp-range 192.168.1.200,192.168.1.240 --dhcp-router 192.168.1.1 --dhcp-dns 1.1.1.1"
+            } else {
+                modeArgs = "--mode proxy"
+            }
+
+            // Free UDP port 67 from macOS bootpd before starting pxe
+            let cmd = "launchctl bootout system/com.apple.bootpd 2>/dev/null || true; killall -9 pxe 2>/dev/null || true; cd '\(pxeDir)' && nohup '\(pxeBin)' serve \(modeArgs) --no-tui </dev/null >/tmp/pxe_app.log 2>&1 &"
+            let script = "do shell script \"\(cmd)\" with administrator privileges"
+
+            var error: NSDictionary?
+            if let appleScript = NSAppleScript(source: script) {
+                appleScript.executeAndReturnError(&error)
+                if let err = error {
+                    print("Admin authorization notice: \(err)")
+                }
+            }
+        }
     }
 
     func setupMenu() {
@@ -122,6 +149,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigati
         serverMenu.addItem(withTitle: "Reload Dashboard", action: #selector(reloadDashboard), keyEquivalent: "r")
         serverMenu.addItem(withTitle: "Open in Web Browser", action: #selector(openInBrowser), keyEquivalent: "b")
         serverMenu.addItem(NSMenuItem.separator())
+        serverMenu.addItem(withTitle: "Restart in ProxyDHCP Mode (Home Router LAN)", action: #selector(restartProxyMode), keyEquivalent: "p")
+        serverMenu.addItem(withTitle: "Restart in Standalone DHCP Mode (Direct Cable)", action: #selector(restartStandaloneMode), keyEquivalent: "s")
+        serverMenu.addItem(NSMenuItem.separator())
         serverMenu.addItem(withTitle: "Open Boot Images on Card", action: #selector(openImagesFolder), keyEquivalent: "o")
         serverMenuItem.submenu = serverMenu
         mainMenu.addItem(serverMenuItem)
@@ -141,6 +171,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigati
         self.loadDashboard()
     }
 
+    @objc func restartProxyMode() {
+        self.startDaemonInBackground(mode: "proxy", forceRestart: true)
+    }
+
+    @objc func restartStandaloneMode() {
+        self.startDaemonInBackground(mode: "standalone", forceRestart: true)
+    }
+
     @objc func openInBrowser() {
         if let url = URL(string: "http://127.0.0.1:8080/dashboard") {
             NSWorkspace.shared.open(url)
@@ -149,7 +187,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigati
 
     @objc func openImagesFolder() {
         let cardPath = "/Volumes/laptopcard/pxe/httpboot"
-        let fallbackPath = "/Users/yocan/pxe/httpboot"
+        let fallbackPath = (NSHomeDirectory() as NSString).appendingPathComponent("pxe/httpboot")
         let target = FileManager.default.fileExists(atPath: cardPath) ? cardPath : fallbackPath
         NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: target)
     }

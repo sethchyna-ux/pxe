@@ -73,6 +73,8 @@ pub enum Commands {
     },
     /// Inspect local network interfaces and show auto-detected IPs
     Status,
+    /// Run full end-to-end PXE boot simulation (ASUS Z97-A Intel I218-V UEFI & Legacy BIOS)
+    Simulate,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,13 +111,67 @@ fn parse_ip_range(s: &str) -> Result<(Ipv4Addr, Ipv4Addr), String> {
     Ok((start, end))
 }
 
-pub fn detect_primary_ipv4() -> Option<Ipv4Addr> {
-    // Attempt UDP probe to find routing default gateway
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("1.1.1.1:80").ok()?;
-    let local_addr = socket.local_addr().ok()?;
-    match local_addr.ip() {
-        IpAddr::V4(ipv4) if !ipv4.is_loopback() => Some(ipv4),
-        _ => None,
+pub fn list_network_interfaces() -> Vec<(String, Ipv4Addr)> {
+    let mut results = Vec::new();
+    #[cfg(unix)]
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) == 0 {
+            let mut cur = ifap;
+            while !cur.is_null() {
+                let ifa = &*cur;
+                let flags = ifa.ifa_flags as libc::c_int;
+                let is_up = (flags & libc::IFF_UP) != 0;
+                let is_loopback = (flags & libc::IFF_LOOPBACK) != 0;
+
+                if is_up && !is_loopback && !ifa.ifa_addr.is_null() {
+                    if (*ifa.ifa_addr).sa_family as libc::c_int == libc::AF_INET {
+                        let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                        let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                        if !ip.is_loopback() && !ip.is_link_local() {
+                            let name = std::ffi::CStr::from_ptr(ifa.ifa_name)
+                                .to_string_lossy()
+                                .to_string();
+                            results.push((name, ip));
+                        }
+                    }
+                }
+                cur = ifa.ifa_next;
+            }
+            libc::freeifaddrs(ifap);
+        }
     }
+    results
+}
+
+pub fn detect_primary_ipv4() -> Option<Ipv4Addr> {
+    let interfaces = list_network_interfaces();
+
+    // 1. Prefer wired Ethernet interfaces (eno*, eth*, enp*, enx*, usb*) if present
+    for (name, ip) in &interfaces {
+        if name.starts_with("eno")
+            || name.starts_with("eth")
+            || name.starts_with("enp")
+            || name.starts_with("enx")
+            || name.starts_with("usb")
+        {
+            return Some(*ip);
+        }
+    }
+
+    // 2. Attempt UDP routing probe if internet/gateway route is available
+    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
+        if socket.connect("1.1.1.1:80").is_ok() {
+            if let Ok(local_addr) = socket.local_addr() {
+                if let IpAddr::V4(ipv4) = local_addr.ip() {
+                    if !ipv4.is_loopback() {
+                        return Some(ipv4);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Offline fallback (e.g. Mac or Android phone plugged directly into ASUS Z97-A via Ethernet cable)
+    interfaces.first().map(|(_, ip)| *ip)
 }

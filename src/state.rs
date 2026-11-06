@@ -125,24 +125,17 @@ impl SharedState {
 
     pub fn update_client(
         &self,
-        mac: &str,
+        mac_or_ip: &str,
         ip: Option<Ipv4Addr>,
         arch: Option<&str>,
         stage: BootStage,
     ) {
         if let Ok(mut lock) = self.clients.lock() {
-            let entry = lock
-                .entry(mac.to_string())
-                .or_insert_with(|| ClientSession {
-                    mac: mac.to_string(),
-                    ip,
-                    arch: arch.unwrap_or("Unknown").to_string(),
-                    stage: stage.clone(),
-                    last_seen: Instant::now(),
-                });
 
             if let Some(ip) = ip {
-                entry.ip = Some(ip);
+                if !ip.is_unspecified() || entry.ip.is_none() {
+                    entry.ip = Some(ip);
+                }
             }
             if let Some(arch) = arch {
                 entry.arch = arch.to_string();

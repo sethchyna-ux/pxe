@@ -259,6 +259,38 @@ async fn handle_autoexec_ipxe(State(ctx): State<HttpServerContext>) -> impl Into
     )
 }
 
+async fn handle_autoexec_ipxe(State(ctx): State<HttpServerContext>) -> impl IntoResponse {
+    let custom_file = ctx.http_dir.join("autoexec.ipxe");
+    let script_content = if custom_file.exists() {
+        match tokio::fs::read_to_string(&custom_file).await {
+            Ok(content) => content
+                .replace("${server_ip}", &ctx.server_ip.to_string())
+                .replace("${http_port}", &ctx.http_port.to_string()),
+            Err(_) => format!(
+                "#!ipxe\nchain --autofree http://{}:{}/boot.ipxe || shell\n",
+                ctx.server_ip, ctx.http_port
+            ),
+        }
+    } else {
+        format!(
+            "#!ipxe\nchain --autofree http://{}:{}/boot.ipxe || shell\n",
+            ctx.server_ip, ctx.http_port
+        )
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8")),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+            ),
+        ],
+        script_content,
+    )
+}
+
 #[derive(Serialize)]
 struct ApiStatusResponse {
     server_ip: String,

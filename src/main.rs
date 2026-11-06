@@ -38,24 +38,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::Status) => {
             println!("=== PXE Server Network Diagnostic ===");
+            let interfaces = pxe::config::list_network_interfaces();
+            if !interfaces.is_empty() {
+                println!("Active Network Interfaces:");
+                for (name, ip) in &interfaces {
+                    println!("  • {name:<10} -> {ip}");
+                }
+            }
             if let Some(ip) = detect_primary_ipv4() {
-                println!("Primary LAN IPv4 detected: {ip}");
+                println!("Primary LAN IPv4 selected: {ip}");
             } else {
                 println!("Could not automatically determine primary LAN IPv4.");
             }
 
             // Check if UDP port 67 is occupied
-            let port_67_occupied = std::net::UdpSocket::bind("0.0.0.0:67").is_err();
-            if port_67_occupied {
-                println!("\n⚠️  UDP Port 67 is currently IN USE by another process.");
-                #[cfg(target_os = "macos")]
-                {
-                    println!("   On macOS, this is typically Apple's built-in 'bootpd' service.");
-                    println!("   To free port 67 for PXE boot, run:");
-                    println!("     sudo launchctl bootout system/com.apple.bootpd\n");
+            match std::net::UdpSocket::bind("0.0.0.0:67") {
+                Ok(_) => println!("✓ UDP Port 67 is available."),
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    println!("ℹ️  UDP Port 67 requires root privileges (run with sudo to bind port 67/69).");
                 }
-            } else {
-                println!("✓ UDP Port 67 is available.");
+                Err(_) => {
+                    println!("\n⚠️  UDP Port 67 is currently IN USE by another process.");
+                    #[cfg(target_os = "macos")]
+                    {
+                        println!("   On macOS, this is typically Apple's built-in 'bootpd' service.");
+                        println!("   To free port 67 for PXE boot, run:");
+                        println!("     sudo launchctl bootout system/com.apple.bootpd\n");
+                    }
+                }
             }
 
             if let Some(ip) = detect_primary_ipv4() {
@@ -63,6 +73,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  sudo pxe serve --bind-ip {ip} --mode proxy");
             }
             return Ok(());
+        }
+        Some(Commands::Simulate) => {
+            println!("=========================================================================");
+            println!(" ⚡ PXE-RS Hardware Boot Simulator — Target: ASUS Z97-A (Intel I218-V)");
+            println!("    MAC: {} | Arch: UEFI x64 (0x0007) + CSM BIOS (0x0000)", pxe::sim::Z97A_MAC_STR);
+            println!("=========================================================================\n");
+
+            let reports = pxe::sim::run_z97a_simulation_suite(&cli.tftp_dir, &cli.http_dir).await?;
+            let mut all_passed = true;
+
+            for report in &reports {
+                let badge = if report.passed { "\x1b[32mPASS\x1b[0m" } else { "\x1b[31mFAIL\x1b[0m" };
+                println!("▶ [{badge}] {}", report.scenario);
+                for step in &report.steps {
+                    let icon = if step.passed { "\x1b[32m✓\x1b[0m" } else { "\x1b[31m✗\x1b[0m" };
+                    println!(
+                        "    {icon} {} ({} ms)\n      └─ {}",
+                        step.step, step.duration_ms, step.detail
+                    );
+                }
+                println!();
+                if !report.passed {
+                    all_passed = false;
+                }
+            }
+
+            if all_passed {
+                println!("\x1b[32m✓ All ASUS Z97-A PXE boot simulations completed with 0 errors.\x1b[0m");
+                return Ok(());
+            } else {
+                eprintln!("\x1b[31m✗ One or more simulation steps failed.\x1b[0m");
+                std::process::exit(1);
+            }
         }
         Some(Commands::Serve) | None => {
             // Proceed to run server below
@@ -129,11 +172,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dhcp_engine = Arc::new(DhcpServer::new(Arc::clone(&state), dhcp_config));
 
     // Initialize TFTP Engine
-    let tftp_engine = Arc::new(TftpServer::new(
-        Arc::clone(&state),
-        cli.tftp_dir.clone(),
-        cli.tftp_port,
-    ));
+    let tftp_engine = Arc::new(
+        TftpServer::new(
+            Arc::clone(&state),
+            cli.tftp_dir.clone(),
+            cli.tftp_port,
+        )
+        .with_http_context(server_ip, cli.http_port),
+    );
 
     // Initialize HTTP Engine
     let http_engine = Arc::new(HttpServer::new(
