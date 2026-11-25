@@ -1,0 +1,5 @@
+#!ipxe
+echo Loading PXE Netboot Menu...
+set dns 8.8.8.8
+chain --autofree http://${server_ip}:${http_port}/boot.ipxe || chain --autofree http://${next-server}:8080/boot.ipxe || shell
+
