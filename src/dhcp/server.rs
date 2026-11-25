@@ -882,39 +882,72 @@ impl DhcpServer {
             && !is_proxy_port
         {
             if let Ok(tx_sock) = Self::create_tx_socket(self.dhcp_port, active_server_ip) {
-                // 1) Always transmit broadcast reply with IP_ONESBCAST=1 to subnet_dest
-                // (wire Dst IP = 255.255.255.255, Dst MAC = ff:ff:ff:ff:ff:ff, Src IP = 10.77.0.3 on en4)
-                let r1 = tx_sock.send_to(&bytes, subnet_dest).await.map(|n| {
-                    (
-                        n,
-                        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, 68)),
-                    )
-                });
-
-                // 2) If this is a Stage 2 iPXE client (Option 77/175) and its IP (10.77.0.2) is already
-                // in the macOS ARP table from Stage 1 UEFI PXE, ALSO send a direct unicast copy to
-                // yiaddr:68 (Dst MAC = client MAC) so UEFI SNP drivers whose receive filter rejects
-                // L2 broadcast frames still deliver the DHCPOFFER/DHCPACK to iPXE!
-                if reply.options.get(&67).is_some_and(|v| !v.ends_with(&[0]))
-                    && !reply.yiaddr.is_unspecified()
-                {
-                    #[cfg(target_os = "macos")]
-                    unsafe {
-                        use std::os::fd::AsRawFd;
-                        const IP_ONESBCAST: libc::c_int = 23;
-                        let zero: libc::c_int = 0;
-                        libc::setsockopt(
-                            tx_sock.as_raw_fd(),
-                            libc::IPPROTO_IP,
-                            IP_ONESBCAST,
-                            &zero as *const _ as *const libc::c_void,
-                            std::mem::size_of_val(&zero) as libc::socklen_t,
-                        );
-                    }
+                // 1) Send with IP_ONESBCAST=1 to subnet_dest (wire Dst IP = 255.255.255.255, Dst MAC = ff:ff:ff:ff:ff:ff, Src IP = 10.77.0.3 on en4)
+                let r1 = tx_sock.send_to(&bytes, subnet_dest).await;
+                // 2) Send with IP_ONESBCAST=0 to subnet_dest (wire Dst IP = 10.77.255.255, Dst MAC = ff:ff:ff:ff:ff:ff, Src IP = 10.77.0.3 on en4)
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    use std::os::fd::AsRawFd;
+                    const IP_ONESBCAST: libc::c_int = 23;
+                    let zero: libc::c_int = 0;
+                    libc::setsockopt(
+                        tx_sock.as_raw_fd(),
+                        libc::IPPROTO_IP,
+                        IP_ONESBCAST,
+                        &zero as *const _ as *const libc::c_void,
+                        std::mem::size_of_val(&zero) as libc::socklen_t,
+                    );
+                }
+                let r2 = tx_sock.send_to(&bytes, subnet_dest).await;
+                // 3) If yiaddr is assigned and already in the ARP cache (e.g. iPXE Stage 2 after UEFI Stage 1),
+                // also transmit a unicast copy to yiaddr:68 so iPXE SNP filters that only accept unicast
+                // frames for their MAC receive the offer immediately.
+                if !reply.yiaddr.is_unspecified() {
                     let unicast_dest = SocketAddr::V4(SocketAddrV4::new(reply.yiaddr, 68));
                     let _ = tx_sock.send_to(&bytes, unicast_dest).await;
                 }
-                r1
+                let _ = tx_sock.send_to(&bytes, target_dest).await;
+
+                // 4) For Stage 2 iPXE (Option 77/175), when `dhcp` calls ifopen() for the first time,
+                // the 2.5GbE PHY takes ~400-800ms to finish RX link training after TX is ready.
+                // Spawn a background re-transmit bursts at +200ms, +500ms, and +900ms so the DHCPOFFER
+                // arrives right after the client's 2.5GbE RX link locks!
+                if reply.options.get(&67).is_some_and(|v| !v.ends_with(&[0])) {
+                    let bytes_clone = bytes.clone();
+                    let yiaddr_copy = reply.yiaddr;
+                    let port_copy = self.dhcp_port;
+                    tokio::spawn(async move {
+                        for delay_ms in [200_u64, 500, 900] {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            if let Ok(burst_sock) = Self::create_tx_socket(port_copy, active_server_ip) {
+                                let _ = burst_sock.send_to(&bytes_clone, subnet_dest).await;
+                                #[cfg(target_os = "macos")]
+                                unsafe {
+                                    use std::os::fd::AsRawFd;
+                                    const IP_ONESBCAST: libc::c_int = 23;
+                                    let zero: libc::c_int = 0;
+                                    libc::setsockopt(
+                                        burst_sock.as_raw_fd(),
+                                        libc::IPPROTO_IP,
+                                        IP_ONESBCAST,
+                                        &zero as *const _ as *const libc::c_void,
+                                        std::mem::size_of_val(&zero) as libc::socklen_t,
+                                    );
+                                }
+                                let _ = burst_sock.send_to(&bytes_clone, subnet_dest).await;
+                                if !yiaddr_copy.is_unspecified() {
+                                    let u_dest = SocketAddr::V4(SocketAddrV4::new(yiaddr_copy, 68));
+                                    let _ = burst_sock.send_to(&bytes_clone, u_dest).await;
+                                }
+                            }
+                        }
+                    });
+                }
+
+                match r1.or(r2) {
+                    Ok(n) => Ok((n, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, 68)))),
+                    Err(e) => Err(e),
+                }
             } else {
                 sock.send_to(&bytes, target_dest)
                     .await
