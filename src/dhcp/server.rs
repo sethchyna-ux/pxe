@@ -1,6 +1,6 @@
 use crate::config::ServerMode;
 use crate::dhcp::packet::{
-    ClientArch, DhcpMessageType, DhcpPacket, BOOTREPLY, HLEN_ETHER, HTYPE_ETHER,
+    BOOTREPLY, ClientArch, DhcpMessageType, DhcpPacket, HLEN_ETHER, HTYPE_ETHER,
 };
 use crate::error::{DhcpError, Result};
 use crate::state::{BootStage, EventLevel, Protocol, SharedState};
@@ -70,16 +70,41 @@ impl DhcpServer {
                 &optval as *const _ as *const libc::c_void,
                 std::mem::size_of_val(&optval) as libc::socklen_t,
             );
-            #[cfg(target_os = "macos")]
-            {
-                const IP_RECVIF: libc::c_int = 20;
-                libc::setsockopt(
-                    socket.as_raw_fd(),
-                    libc::IPPROTO_IP,
-                    IP_RECVIF,
-                    &optval as *const _ as *const libc::c_void,
-                    std::mem::size_of_val(&optval) as libc::socklen_t,
-                );
+        }
+        #[cfg(target_os = "macos")]
+        if !_server_ip.is_loopback() && !_server_ip.is_unspecified() {
+            for (if_name, ip) in crate::config::list_network_interfaces() {
+                if ip == _server_ip {
+                    if let Ok(c_name) = std::ffi::CString::new(if_name) {
+                        unsafe {
+                            use std::os::fd::AsRawFd;
+                            let idx = libc::if_nametoindex(c_name.as_ptr());
+                            if idx != 0 {
+                                const IP_BOUND_IF: libc::c_int = 25;
+                                libc::setsockopt(
+                                    socket.as_raw_fd(),
+                                    libc::IPPROTO_IP,
+                                    IP_BOUND_IF,
+                                    &idx as *const _ as *const libc::c_void,
+                                    std::mem::size_of_val(&idx) as libc::socklen_t,
+                                );
+                                // Enable IP_ONESBCAST (23) on macOS so sending to the subnet-directed
+                                // broadcast (10.77.255.255) routes via en4 AND rewrites the IPv4
+                                // destination header on the wire to 255.255.255.255 (RFC 2131 / UEFI PXE).
+                                const IP_ONESBCAST: libc::c_int = 23;
+                                let one: libc::c_int = 1;
+                                libc::setsockopt(
+                                    socket.as_raw_fd(),
+                                    libc::IPPROTO_IP,
+                                    IP_ONESBCAST,
+                                    &one as *const _ as *const libc::c_void,
+                                    std::mem::size_of_val(&one) as libc::socklen_t,
+                                );
+                            }
+                        }
+                    }
+                    break;
+                }
             }
         }
         socket.set_nonblocking(true)?;
@@ -91,78 +116,60 @@ impl DhcpServer {
         UdpSocket::from_std(std_socket)
     }
 
-    /// Receive a UDP datagram along with the receiving interface name (via IP_RECVIF on macOS).
-    async fn recv_from_with_if(
-        sock: &UdpSocket,
-        buf: &mut [u8],
-    ) -> std::io::Result<(usize, SocketAddr, Option<String>)> {
+    fn create_tx_socket(port: u16, server_ip: Ipv4Addr) -> std::io::Result<UdpSocket> {
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(SocketProto::UDP))?;
+        socket.set_broadcast(true)?;
+        socket.set_reuse_address(true)?;
+        #[cfg(unix)]
+        unsafe {
+            use std::os::fd::AsRawFd;
+            let optval: libc::c_int = 1;
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&optval) as libc::socklen_t,
+            );
+        }
         #[cfg(target_os = "macos")]
         {
-            use std::os::fd::AsRawFd;
-            loop {
-                sock.readable().await?;
-                let mut iov = libc::iovec {
-                    iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-                    iov_len: buf.len(),
-                };
-                let mut src_storage: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-                let mut cmsg_buf = [0u8; 256];
-                let mut msg = libc::msghdr {
-                    msg_name: &mut src_storage as *mut _ as *mut libc::c_void,
-                    msg_namelen: std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                    msg_iov: &mut iov,
-                    msg_iovlen: 1,
-                    msg_control: cmsg_buf.as_mut_ptr() as *mut libc::c_void,
-                    msg_controllen: cmsg_buf.len() as libc::socklen_t,
-                    msg_flags: 0,
-                };
-
-                let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, 0) };
-                if n < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::WouldBlock {
-                        continue;
-                    }
-                    return Err(err);
-                }
-
-                let src_ip = Ipv4Addr::from(u32::from_be(src_storage.sin_addr.s_addr));
-                let src_port = u16::from_be(src_storage.sin_port);
-                let src_addr = SocketAddr::V4(SocketAddrV4::new(src_ip, src_port));
-
-                let mut recv_if_name = None;
-                unsafe {
-                    let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-                    while !cmsg.is_null() {
-                        if (*cmsg).cmsg_level == libc::IPPROTO_IP && (*cmsg).cmsg_type == 20 {
-                            let data_ptr = libc::CMSG_DATA(cmsg);
-                            // sockaddr_dl: sdl_len (u8), sdl_family (u8), sdl_index (u16)
-                            let sdl_index = u16::from_ne_bytes([*data_ptr.add(2), *data_ptr.add(3)]);
-                            if sdl_index != 0 {
-                                let mut ifname_buf = [0 as libc::c_char; libc::IFNAMSIZ];
-                                if !libc::if_indextoname(
-                                    sdl_index as libc::c_uint,
-                                    ifname_buf.as_mut_ptr(),
-                                )
-                                .is_null()
-                                {
-                                    let cstr = std::ffi::CStr::from_ptr(ifname_buf.as_ptr());
-                                    recv_if_name = Some(cstr.to_string_lossy().to_string());
-                                }
+            for (if_name, ip) in crate::config::list_network_interfaces() {
+                if ip == server_ip {
+                    if let Ok(c_name) = std::ffi::CString::new(if_name) {
+                        unsafe {
+                            use std::os::fd::AsRawFd;
+                            let idx = libc::if_nametoindex(c_name.as_ptr());
+                            if idx != 0 {
+                                const IP_BOUND_IF: libc::c_int = 25;
+                                libc::setsockopt(
+                                    socket.as_raw_fd(),
+                                    libc::IPPROTO_IP,
+                                    IP_BOUND_IF,
+                                    &idx as *const _ as *const libc::c_void,
+                                    std::mem::size_of_val(&idx) as libc::socklen_t,
+                                );
+                                const IP_ONESBCAST: libc::c_int = 23;
+                                let one: libc::c_int = 1;
+                                libc::setsockopt(
+                                    socket.as_raw_fd(),
+                                    libc::IPPROTO_IP,
+                                    IP_ONESBCAST,
+                                    &one as *const _ as *const libc::c_void,
+                                    std::mem::size_of_val(&one) as libc::socklen_t,
+                                );
                             }
                         }
-                        cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
                     }
+                    break;
                 }
-
-                return Ok((n as usize, src_addr, recv_if_name));
             }
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let (len, src) = sock.recv_from(buf).await?;
-            Ok((len, src, None))
-        }
+        socket.set_nonblocking(true)?;
+        let bind_addr = SocketAddrV4::new(server_ip, port);
+        socket.bind(&bind_addr.into())?;
+        let std_socket: std::net::UdpSocket = socket.into();
+        UdpSocket::from_std(std_socket)
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -170,10 +177,7 @@ impl DhcpServer {
             Ok(s) => s,
             Err(e) => {
                 #[allow(unused_mut)]
-                let mut msg = format!(
-                    "Failed to bind DHCP port {}: {e}",
-                    self.dhcp_port
-                );
+                let mut msg = format!("Failed to bind DHCP port {}: {e}", self.dhcp_port);
                 #[cfg(target_os = "macos")]
                 if e.raw_os_error() == Some(48) && self.dhcp_port == 67 {
                     msg.push_str(" -> Port 67 is held by macOS built-in bootpd daemon. Free it with: sudo launchctl bootout system/com.apple.bootpd");
@@ -220,11 +224,11 @@ impl DhcpServer {
         let main_task = tokio::spawn(async move {
             let mut buf = [0u8; 2048];
             loop {
-                match Self::recv_from_with_if(&dhcp_sock, &mut buf).await {
-                    Ok((len, src, recv_if)) => {
+                match dhcp_sock.recv_from(&mut buf).await {
+                    Ok((len, src)) => {
                         this_main.state.record_dhcp_in();
                         if let Err(e) = this_main
-                            .handle_packet_on_if(&dhcp_sock, &buf[..len], src, false, recv_if.as_deref())
+                            .handle_packet_on_if(&dhcp_sock, &buf[..len], src, false, None)
                             .await
                         {
                             this_main.state.record_error();
@@ -253,11 +257,11 @@ impl DhcpServer {
             Some(tokio::spawn(async move {
                 let mut buf = [0u8; 2048];
                 loop {
-                    match Self::recv_from_with_if(&sock, &mut buf).await {
-                        Ok((len, src, recv_if)) => {
+                    match sock.recv_from(&mut buf).await {
+                        Ok((len, src)) => {
                             this_proxy.state.record_dhcp_in();
                             if let Err(e) = this_proxy
-                                .handle_packet_on_if(&sock, &buf[..len], src, true, recv_if.as_deref())
+                                .handle_packet_on_if(&sock, &buf[..len], src, true, None)
                                 .await
                             {
                                 this_proxy.state.record_error();
@@ -292,10 +296,23 @@ impl DhcpServer {
     }
 
     /// Resolve the active server IP, subnet mask, and mode for the interface that received the packet.
-    fn resolve_interface_context(&self, recv_if: Option<&str>) -> (Ipv4Addr, Ipv4Addr, ServerMode) {
+    fn resolve_interface_context(
+        &self,
+        recv_if: Option<&str>,
+    ) -> Option<(Ipv4Addr, Ipv4Addr, ServerMode)> {
         if !self.server_ip.is_loopback()
             && let Some(if_name) = recv_if
         {
+            // If we are bound to a specific direct Ethernet cable (e.g. 10.77.0.3 on en4),
+            // ignore DHCP broadcasts bleeding in from Wi-Fi (en0) so Wi-Fi devices never steal direct-cable leases.
+            if let Some((bound_if, _, _)) = crate::config::list_network_interfaces_detailed()
+                .into_iter()
+                .find(|(_, ip, _)| *ip == self.server_ip)
+                && bound_if != if_name
+            {
+                return None;
+            }
+
             for (name, ip, mask) in crate::config::list_network_interfaces_detailed() {
                 if name == if_name {
                     let mode = if self.mode == ServerMode::Standalone
@@ -305,11 +322,11 @@ impl DhcpServer {
                     } else {
                         ServerMode::Proxy
                     };
-                    return (ip, mask, mode);
+                    return Some((ip, mask, mode));
                 }
             }
         }
-        (self.server_ip, self.subnet_mask, self.mode)
+        Some((self.server_ip, self.subnet_mask, self.mode))
     }
 
     async fn handle_packet_on_if(
@@ -320,6 +337,12 @@ impl DhcpServer {
         is_proxy_port: bool,
         recv_if: Option<&str>,
     ) -> Result<()> {
+        let Some((active_server_ip, active_mask, active_mode)) =
+            self.resolve_interface_context(recv_if)
+        else {
+            return Ok(());
+        };
+
         let packet = match DhcpPacket::parse(buf) {
             Ok(p) => p,
             Err(e) => {
@@ -331,8 +354,6 @@ impl DhcpServer {
             Some(t) => t,
             None => return Ok(()), // Ignore non-DHCP BOOTP packets
         };
-
-        let (active_server_ip, active_mask, active_mode) = self.resolve_interface_context(recv_if);
         let mac = packet.mac_string();
         let arch = packet.client_arch();
         let is_ipxe = packet.is_ipxe();
@@ -360,18 +381,27 @@ impl DhcpServer {
                     return Ok(());
                 }
 
-                // In ProxyDHCP mode on a shared router LAN, ignore non-PXE DHCPDISCOVER broadcasts
-                // (e.g. routers, phones, or printers that do not include Option 60/93/94/77/175).
-                if active_mode == ServerMode::Proxy && !is_pxe && !self.server_ip.is_loopback() {
+                // Ignore non-PXE DHCPDISCOVER broadcasts from the Wi-Fi LAN (e.g. routers, phones, or printers
+                // that do not include Option 60/93/94/77/175) so they never steal direct-cable PXE leases (10.77.0.2).
+                if !is_pxe && !self.server_ip.is_loopback() {
                     return Ok(());
                 }
 
                 let arch_desc = arch.display_name();
                 let ipxe_suffix = if is_ipxe { " (iPXE Stage 2)" } else { "" };
+                let vc_tag = packet
+                    .vendor_class()
+                    .map(|v| format!(" vc=\"{v}\""))
+                    .unwrap_or_default();
+                let mut opt_keys: Vec<u8> = packet.options.keys().copied().collect();
+                opt_keys.sort_unstable();
                 self.state.log(
                     EventLevel::Info,
                     Protocol::Dhcp,
-                    format!("DHCPDISCOVER from {mac}{if_tag} [{arch_desc}{ipxe_suffix}]"),
+                    format!(
+                        "DHCPDISCOVER from {mac}{if_tag} [{arch_desc}{ipxe_suffix}] xid={:#010x} flags={:#06x}{vc_tag} opts={:?}",
+                        packet.xid, packet.flags, opt_keys
+                    ),
                 );
 
                 self.state.update_client(
@@ -425,7 +455,11 @@ impl DhcpServer {
 
                 if should_respond {
                     let arch_desc = arch.display_name();
-                    let port_tag = if is_proxy_port { " (ProxyDHCP :4011)" } else { "" };
+                    let port_tag = if is_proxy_port {
+                        " (ProxyDHCP :4011)"
+                    } else {
+                        ""
+                    };
                     self.state.log(
                         EventLevel::Info,
                         Protocol::Dhcp,
@@ -441,8 +475,15 @@ impl DhcpServer {
                         active_mask,
                         active_mode,
                     )? {
-                        self.send_reply(sock, &reply, src, is_proxy_port, recv_if, active_server_ip)
-                            .await?;
+                        self.send_reply(
+                            sock,
+                            &reply,
+                            src,
+                            is_proxy_port,
+                            recv_if,
+                            active_server_ip,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -502,13 +543,35 @@ impl DhcpServer {
             let server_ip_bytes = server_ip.octets();
             let opt43 = vec![
                 // Sub-option 6: Discovery Control (value 8 = bypass menu and use bootfile)
-                6, 1, 8,
+                6,
+                1,
+                8,
                 // Sub-option 8: PXE Boot Server IP (type 8, length 7, payload 0,0,1,<server_ip>)
-                8, 7, 0, 0, 1, server_ip_bytes[0], server_ip_bytes[1], server_ip_bytes[2], server_ip_bytes[3],
+                8,
+                7,
+                0,
+                0,
+                1,
+                server_ip_bytes[0],
+                server_ip_bytes[1],
+                server_ip_bytes[2],
+                server_ip_bytes[3],
                 // Sub-option 9: PXE Boot Menu (Type 0, Length 6, "PXE")
-                9, 6, 0, 0, 3, 80, 88, 69,
+                9,
+                6,
+                0,
+                0,
+                3,
+                80,
+                88,
+                69,
                 // Sub-option 10: PXE Menu Prompt (Timeout 0, "PXE")
-                10, 4, 0, 80, 88, 69,
+                10,
+                4,
+                0,
+                80,
+                88,
+                69,
             ];
             reply.options.insert(43, opt43);
         }
@@ -591,20 +654,14 @@ impl DhcpServer {
         reply.options.insert(53, vec![DhcpMessageType::Offer as u8]);
 
         // Option 54: Server Identifier
-        reply
-            .options
-            .insert(54, server_ip.octets().to_vec());
+        reply.options.insert(54, server_ip.octets().to_vec());
 
         if mode == ServerMode::Proxy {
             self.populate_pxe_vendor_options(req, &mut reply, arch, server_ip);
         } else {
             // Standalone mode options (strictly isolated from ProxyDHCP)
-            reply
-                .options
-                .insert(51, lease_time.to_be_bytes().to_vec());
-            reply
-                .options
-                .insert(1, subnet_mask.octets().to_vec());
+            reply.options.insert(51, lease_time.to_be_bytes().to_vec());
+            reply.options.insert(1, subnet_mask.octets().to_vec());
 
             let router_ip = if server_ip == self.server_ip {
                 self.router.unwrap_or(server_ip)
@@ -712,19 +769,13 @@ impl DhcpServer {
         reply.options.insert(53, vec![DhcpMessageType::Ack as u8]);
 
         // Option 54: Server Identifier
-        reply
-            .options
-            .insert(54, server_ip.octets().to_vec());
+        reply.options.insert(54, server_ip.octets().to_vec());
 
         if mode == ServerMode::Proxy {
             self.populate_pxe_vendor_options(req, &mut reply, arch, server_ip);
         } else {
-            reply
-                .options
-                .insert(51, lease_time.to_be_bytes().to_vec());
-            reply
-                .options
-                .insert(1, subnet_mask.octets().to_vec());
+            reply.options.insert(51, lease_time.to_be_bytes().to_vec());
+            reply.options.insert(1, subnet_mask.octets().to_vec());
             let router_ip = if server_ip == self.server_ip {
                 self.router.unwrap_or(server_ip)
             } else {
@@ -795,6 +846,15 @@ impl DhcpServer {
                             &idx as *const _ as *const libc::c_void,
                             std::mem::size_of_val(&idx) as libc::socklen_t,
                         );
+                        const IP_ONESBCAST: libc::c_int = 23;
+                        let one: libc::c_int = 1;
+                        libc::setsockopt(
+                            sock.as_raw_fd(),
+                            libc::IPPROTO_IP,
+                            IP_ONESBCAST,
+                            &one as *const _ as *const libc::c_void,
+                            std::mem::size_of_val(&one) as libc::socklen_t,
+                        );
                     }
                 }
             }
@@ -809,19 +869,71 @@ impl DhcpServer {
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, 68))
         };
 
-        let subnet_bcast = Ipv4Addr::from(u32::from(active_server_ip) | !u32::from(self.subnet_mask));
+        let subnet_bcast =
+            Ipv4Addr::from(u32::from(active_server_ip) | !u32::from(self.subnet_mask));
         let subnet_dest = SocketAddr::V4(SocketAddrV4::new(subnet_bcast, 68));
 
-        let send_res = match sock.send_to(&bytes, target_dest).await {
-            Ok(n) => Ok((n, target_dest)),
-            Err(e) if target_dest.ip() == Ipv4Addr::BROADCAST && subnet_bcast != Ipv4Addr::BROADCAST => {
-                // Offline direct-cable fallback when 255.255.255.255 returns EHOSTUNREACH / ENETUNREACH
-                sock.send_to(&bytes, subnet_dest)
+        // On macOS, a socket bound to 0.0.0.0:67 stamps source IP 192.168.1.172 (en0) on
+        // 255.255.255.255 broadcasts even when IP_BOUND_IF is set.
+        // To guarantee the IPv4 header on the wire has Src IP = 10.77.0.3 (active_server_ip)
+        // and exits en4, we transmit from a dedicated socket explicitly bound to active_server_ip:67.
+        let send_res = if !active_server_ip.is_loopback()
+            && !active_server_ip.is_unspecified()
+            && !is_proxy_port
+        {
+            if let Ok(tx_sock) = Self::create_tx_socket(self.dhcp_port, active_server_ip) {
+                // 1) Always transmit broadcast reply with IP_ONESBCAST=1 to subnet_dest
+                // (wire Dst IP = 255.255.255.255, Dst MAC = ff:ff:ff:ff:ff:ff, Src IP = 10.77.0.3 on en4)
+                let r1 = tx_sock.send_to(&bytes, subnet_dest).await.map(|n| {
+                    (
+                        n,
+                        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, 68)),
+                    )
+                });
+
+                // 2) If this is a Stage 2 iPXE client (Option 77/175) and its IP (10.77.0.2) is already
+                // in the macOS ARP table from Stage 1 UEFI PXE, ALSO send a direct unicast copy to
+                // yiaddr:68 (Dst MAC = client MAC) so UEFI SNP drivers whose receive filter rejects
+                // L2 broadcast frames still deliver the DHCPOFFER/DHCPACK to iPXE!
+                if reply.options.get(&67).is_some_and(|v| !v.ends_with(&[0]))
+                    && !reply.yiaddr.is_unspecified()
+                {
+                    #[cfg(target_os = "macos")]
+                    unsafe {
+                        use std::os::fd::AsRawFd;
+                        const IP_ONESBCAST: libc::c_int = 23;
+                        let zero: libc::c_int = 0;
+                        libc::setsockopt(
+                            tx_sock.as_raw_fd(),
+                            libc::IPPROTO_IP,
+                            IP_ONESBCAST,
+                            &zero as *const _ as *const libc::c_void,
+                            std::mem::size_of_val(&zero) as libc::socklen_t,
+                        );
+                    }
+                    let unicast_dest = SocketAddr::V4(SocketAddrV4::new(reply.yiaddr, 68));
+                    let _ = tx_sock.send_to(&bytes, unicast_dest).await;
+                }
+                r1
+            } else {
+                sock.send_to(&bytes, target_dest)
                     .await
-                    .map(|n| (n, subnet_dest))
-                    .map_err(|_| e)
+                    .map(|n| (n, target_dest))
             }
-            Err(e) => Err(e),
+        } else {
+            match sock.send_to(&bytes, target_dest).await {
+                Ok(n) => Ok((n, target_dest)),
+                Err(e)
+                    if target_dest.ip() == Ipv4Addr::BROADCAST
+                        && subnet_bcast != Ipv4Addr::BROADCAST =>
+                {
+                    sock.send_to(&bytes, subnet_dest)
+                        .await
+                        .map(|n| (n, subnet_dest))
+                        .map_err(|_| e)
+                }
+                Err(e) => Err(e),
+            }
         };
 
         match send_res {
@@ -853,23 +965,25 @@ impl DhcpServer {
             Some((s, e)) if server_ip == self.server_ip => (s, e),
             _ => {
                 let oct = server_ip.octets();
+                // On direct Ethernet link (e.g. 10.77.0.3), start pool at .2 (10.77.0.2)
                 (
-                    Ipv4Addr::new(oct[0], oct[1], oct[2], 200),
-                    Ipv4Addr::new(oct[0], oct[1], oct[2], 250),
+                    Ipv4Addr::new(oct[0], oct[1], oct[2], 2),
+                    Ipv4Addr::new(oct[0], oct[1], oct[2], 50),
                 )
             }
         };
 
-        let mut lock = self.leases.lock().map_err(|_| {
-            crate::error::PxeError::Config("Lease lock poisoned".to_string())
-        })?;
+        let mut lock = self
+            .leases
+            .lock()
+            .map_err(|_| crate::error::PxeError::Config("Lease lock poisoned".to_string()))?;
 
         // Check if MAC already has a valid lease
         if let Some((ip, _)) = lock.get(mac) {
             return Ok(*ip);
         }
 
-        // Find first free IP in range
+        // Find first free IP in range (skipping server_ip itself)
         let start_u32 = u32::from(start);
         let end_u32 = u32::from(end);
 
@@ -877,7 +991,7 @@ impl DhcpServer {
 
         for candidate_u32 in start_u32..=end_u32 {
             let candidate = Ipv4Addr::from(candidate_u32);
-            if !active_ips.contains(&candidate) {
+            if candidate != server_ip && !active_ips.contains(&candidate) {
                 lock.insert(mac.to_string(), (candidate, Instant::now()));
                 return Ok(candidate);
             }

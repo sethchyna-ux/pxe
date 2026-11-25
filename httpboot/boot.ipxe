@@ -1,31 +1,67 @@
 #!ipxe
-# Custom PXE Netboot Menu
-# Dynamic Variables: ${server_ip} and ${http_port} are interpolated by pxe-rs
+# Custom PXE Netboot Menu (Embedded directly in autoexec.ipxe so it renders immediately)
+# Primary Menu URL: http://${server_ip}:${http_port}/boot.ipxe
 
 set base_url http://${server_ip}:${http_port}
 
 :start
-menu PXE Netboot Menu [Client MAC: ${mac} | Arch: ${buildarch}]
+menu PXE Netboot Menu [Server: ${server_ip}:${http_port} | Arch: ${buildarch}]
 item --gap --             ---------------- Linux Distributions ----------------
+item endeavouros          EndeavourOS Titan-Nova Live Installer (Arch-based GUI)
 item ubuntu               Ubuntu 24.04 LTS Live Server
 item debian               Debian 12 Bookworm (Netboot Installer)
 item arch                 Arch Linux (Latest Rolling Netboot)
 item fedora               Fedora 44 Server (Netinstall)
 item alpine               Alpine Linux 3.20 (Fast RAM Boot ~20MB)
 item --gap --             ---------------- Diagnostics & Multi-Boot -----------
-item netboot_xyz          Chainload netboot.xyz (50+ Cloud OS Catalog)
+item netboot_xyz          Chainload netboot.xyz (50+ Cloud OS Catalog via Local Proxy)
 item memtest              Memtest86+ Memory Diagnostics
 item --gap --             ---------------- System Control ---------------------
 item ipxe_shell           Drop to interactive iPXE shell
 item reboot               Reboot host
 item exit                 Exit and boot from local drive
 # Wait indefinitely for user selection (no timeout bootloop)
-choose --timeout 0 --default ubuntu target && goto ${target}
+choose --timeout 0 --default endeavouros target && goto ${target}
+
+:ensure_net
+echo Configuring UEFI network interface (10.77.0.2 -> ${server_ip})...
+ifopen ||
+set idx:int32 0
+:cfg_loop
+isset ${net${idx}/mac} || goto cfg_done
+echo Opening net${idx} (${net${idx}/mac}) -> 10.77.0.2/16 gw ${server_ip}
+ifopen net${idx} ||
+set net${idx}/ip 10.77.0.2 ||
+set net${idx}/netmask 255.255.0.0 ||
+set net${idx}/gateway ${server_ip} ||
+inc idx && iseq ${idx} 8 || goto cfg_loop
+:cfg_done
+set dns ${server_ip}
+ifstat ||
+route ||
+goto ${boot_target}
+
+# -----------------------------------------------------------------------------
+# EndeavourOS Live Installer (Proxied or Cached via 10.77.0.3:8080)
+# -----------------------------------------------------------------------------
+:endeavouros
+set boot_target do_endeavouros
+goto ensure_net
+:do_endeavouros
+echo Booting EndeavourOS Titan-Nova Live Installer via ${base_url}...
+set eos_url ${base_url}/gh-mirror/asset-mirror/releases/download/Titan-Nova-2026.08.15-a87b6a2f/
+imgfree
+kernel ${eos_url}vmlinuz BOOTIF=${netX/mac} ip=dhcp net.ifnames=0 archiso_http_srv=${eos_url} archisobasedir=arch cow_spacesize=10G earlymodules=loop modules-load=loop rd.modules-load=loop nvidia nouveau.modeset=0 nouveau.blacklist=yes modprobe.blacklist=nouveau i915.modeset=1 radeon.modeset=1 initrd=initrd.magic
+initrd --name initrd.magic ${eos_url}initrd
+boot || goto failed
 
 # -----------------------------------------------------------------------------
 # Ubuntu 24.04 LTS Live Server
 # -----------------------------------------------------------------------------
 :ubuntu
+set boot_target do_ubuntu
+goto ensure_net
+:do_ubuntu
 echo Booting Ubuntu 24.04 Live Server from ${base_url}...
 kernel ${base_url}/ubuntu/vmlinuz initrd=initrd ip=dhcp url=${base_url}/ubuntu/ubuntu-24.04.4-live-server-amd64.iso cloud-config-url=/dev/null ---
 initrd ${base_url}/ubuntu/initrd
@@ -35,6 +71,9 @@ boot || goto failed
 # Debian 12 Bookworm (Netboot Installer)
 # -----------------------------------------------------------------------------
 :debian
+set boot_target do_debian
+goto ensure_net
+:do_debian
 echo Booting Debian 12 Bookworm Installer from ${base_url}...
 kernel ${base_url}/debian/linux initrd=initrd.gz ip=dhcp --- quiet
 initrd ${base_url}/debian/initrd.gz
@@ -44,6 +83,9 @@ boot || goto failed
 # Arch Linux (Rolling Netboot)
 # -----------------------------------------------------------------------------
 :arch
+set boot_target do_arch
+goto ensure_net
+:do_arch
 echo Booting Arch Linux Netboot from ${base_url}...
 kernel ${base_url}/arch/vmlinuz-linux initrd=initramfs-linux.img ip=dhcp archiso_http_srv=https://geo.mirror.pkgbuild.com/iso/latest/ cms_verify=y archisobasedir=arch cow_spacesize=4G quiet
 initrd ${base_url}/arch/initramfs-linux.img
@@ -53,6 +95,9 @@ boot || goto failed
 # Fedora 44 Server
 # -----------------------------------------------------------------------------
 :fedora
+set boot_target do_fedora
+goto ensure_net
+:do_fedora
 echo Booting Fedora 44 Server from ${base_url}...
 kernel ${base_url}/fedora/vmlinuz ip=dhcp inst.repo=https://mirrors.kernel.org/fedora/releases/44/Server/x86_64/os/ quiet
 initrd ${base_url}/fedora/initrd.img
@@ -62,6 +107,9 @@ boot || goto failed
 # Alpine Linux (Fast RAM boot)
 # -----------------------------------------------------------------------------
 :alpine
+set boot_target do_alpine
+goto ensure_net
+:do_alpine
 echo Booting Alpine Linux from ${base_url}...
 kernel ${base_url}/alpine/vmlinuz-virt ip=dhcp alpine_repo=https://dl-cdn.alpinelinux.org/alpine/v3.20/main/ modloop=${base_url}/alpine/modloop-virt quiet
 initrd ${base_url}/alpine/initramfs-virt
@@ -71,13 +119,22 @@ boot || goto failed
 # Utilities & Diagnostic Tools
 # -----------------------------------------------------------------------------
 :memtest
+set boot_target do_memtest
+goto ensure_net
+:do_memtest
 echo Loading Memtest86+...
 iseq ${platform} efi && chain --autofree ${base_url}/tools/memtest.efi || kernel ${base_url}/tools/memtest.bin
 boot || goto failed
 
 :netboot_xyz
-echo Loading upstream netboot.xyz cloud catalog...
-chain --autofree https://boot.netboot.xyz || goto failed
+set boot_target do_netboot_xyz
+goto ensure_net
+:do_netboot_xyz
+echo Loading netboot.xyz cloud catalog via local HTTP proxy (${base_url}/netboot.xyz/menu.ipxe)...
+set conn_type http
+set boot_domain ${server_ip}:${http_port}/netboot.xyz
+set live_endpoint ${base_url}/gh-mirror
+chain --autofree ${base_url}/netboot.xyz/menu.ipxe || chain --autofree tftp://${server_ip}/netboot_menu.ipxe || goto failed
 
 :ipxe_shell
 echo Type 'exit' to return to menu, or run iPXE commands directly.
@@ -91,6 +148,6 @@ reboot
 exit
 
 :failed
-echo Boot execution failed. Press any key to return to menu...
-prompt
+echo Boot execution failed. Opening diagnostic iPXE shell (run 'ifstat' or 'dhcp' to inspect)...
+shell
 goto start

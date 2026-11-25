@@ -81,6 +81,7 @@ EOF
 
 echo "==> [5/5] Deploying app shortcuts..."
 # Make accessible in Applications or user's Desktop
+rm -rf ~/Desktop/"PXE Server.app" ~/Applications/"PXE Server.app" 2>/dev/null || true
 ln -sf "$APP_DIR" ~/Desktop/ 2>/dev/null || true
 mkdir -p ~/Applications
 cp -R "$APP_DIR" ~/Applications/ 2>/dev/null || true

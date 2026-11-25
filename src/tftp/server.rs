@@ -404,6 +404,25 @@ impl TftpServer {
             }
         }
 
+        // AMI UEFI PXE un-null-terminated Option 67 trailing-byte fallback (e.g. "ipxe.efia" or "undionly.kpxea")
+        if !full_path.exists() {
+            for known_ext in &[".efi", ".kpxe", ".0", ".ipxe", ".c32", ".bin"] {
+                if let Some(pos) = clean_name.to_lowercase().rfind(known_ext) {
+                    let truncated = &clean_name[..pos + known_ext.len()];
+                    if truncated.len() < clean_name.len() {
+                        let alt = self.tftp_dir.join(truncated);
+                        if alt.exists() {
+                            full_path = alt;
+                            break;
+                        } else if let Some(ci) = Self::find_case_insensitive(&self.tftp_dir, truncated) {
+                            full_path = ci;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         if !full_path.exists() {
             return Err(TftpError::FileNotFound(clean_name));
         }

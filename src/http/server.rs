@@ -2,7 +2,7 @@ use crate::error::{HttpError, Result};
 use crate::state::{BootStage, EventLevel, Protocol, SharedState};
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -97,6 +97,9 @@ impl HttpServer {
             )
             .route("/boot.ipxe", get(handle_boot_ipxe))
             .route("/autoexec.ipxe", get(handle_autoexec_ipxe))
+            .route("/netboot.xyz/{*path}", get(handle_netboot_xyz_proxy))
+            .route("/gh-mirror/{*path}", get(handle_github_mirror_proxy))
+            .route("/proxy", get(handle_generic_http_proxy))
             .fallback_service(ServeDir::new(&self.ctx.http_dir))
             .layer(middleware::from_fn_with_state(
                 ctx.clone(),
@@ -593,6 +596,17 @@ fn official_presets() -> Vec<ImagePreset> {
             files: vec![PresetFile { url: "https://memtest.org/download/v7.00/memtest86+-7.00.bin".into(), filename: "memtest.bin".into() }],
         },
         ImagePreset {
+            id: "endeavouros".into(),
+            name: "EndeavourOS Titan-Nova".into(),
+            category: "endeavouros".into(),
+            description: "EndeavourOS Live GUI Installer (Arch-based rolling release).".into(),
+            size_estimate: "~245 MB (kernel+initrd)".into(),
+            files: vec![
+                PresetFile { url: "https://github.com/netbootxyz/asset-mirror/releases/download/Titan-Nova-2026.08.15-a87b6a2f/vmlinuz".into(), filename: "vmlinuz".into() },
+                PresetFile { url: "https://github.com/netbootxyz/asset-mirror/releases/download/Titan-Nova-2026.08.15-a87b6a2f/initrd".into(), filename: "initrd".into() },
+            ],
+        },
+        ImagePreset {
             id: "netboot_xyz".into(),
             name: "netboot.xyz".into(),
             category: "tools".into(),
@@ -873,6 +887,266 @@ async fn handle_api_upload_image(
 
 fn generate_default_autoexec_script(server_ip: Ipv4Addr, http_port: u16) -> String {
     format!("#!ipxe\nchain --autofree http://{server_ip}:{http_port}/boot.ipxe || shell\n")
+}
+
+#[derive(Deserialize)]
+struct GenericProxyQuery {
+    url: String,
+}
+
+async fn handle_netboot_xyz_proxy(
+    State(ctx): State<HttpServerContext>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    AxumPath(path): AxumPath<String>,
+) -> Response {
+    let client_srv_ip = match addr.ip() {
+        std::net::IpAddr::V4(c_ip) => {
+            crate::config::resolve_server_ip_for_client(c_ip, ctx.server_ip)
+        }
+        _ => ctx.server_ip,
+    };
+    let clean_path = path.trim_start_matches('/');
+    let upstream_url = format!("https://boot.netboot.xyz/{clean_path}");
+    proxy_upstream_request(&ctx, client_srv_ip, &upstream_url, true).await
+}
+
+async fn handle_github_mirror_proxy(
+    State(ctx): State<HttpServerContext>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    AxumPath(path): AxumPath<String>,
+) -> Response {
+    let client_srv_ip = match addr.ip() {
+        std::net::IpAddr::V4(c_ip) => {
+            crate::config::resolve_server_ip_for_client(c_ip, ctx.server_ip)
+        }
+        _ => ctx.server_ip,
+    };
+    let clean_path = path.trim_start_matches('/');
+    // Also check if cached locally in httpboot/endeavouros/
+    if clean_path.contains("Titan-Nova")
+        && let Some(fname) = clean_path.rsplit('/').next()
+    {
+        let local_cache = ctx.http_dir.join("endeavouros").join(fname);
+        if local_cache.is_file()
+            && let Ok(bytes) = tokio::fs::read(&local_cache).await
+        {
+            return (
+                StatusCode::OK,
+                [
+                    (
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/octet-stream"),
+                    ),
+                    (
+                        header::CONTENT_LENGTH,
+                        HeaderValue::from_str(&bytes.len().to_string())
+                            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+                    ),
+                ],
+                bytes,
+            )
+                .into_response();
+        }
+    }
+    let upstream_url = format!("https://github.com/netbootxyz/{clean_path}");
+    proxy_upstream_request(&ctx, client_srv_ip, &upstream_url, false).await
+}
+
+async fn handle_generic_http_proxy(
+    State(ctx): State<HttpServerContext>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(q): Query<GenericProxyQuery>,
+) -> Response {
+    if !valid_download_url(&q.url) {
+        return (StatusCode::BAD_REQUEST, "Invalid upstream URL").into_response();
+    }
+    let client_srv_ip = match addr.ip() {
+        std::net::IpAddr::V4(c_ip) => {
+            crate::config::resolve_server_ip_for_client(c_ip, ctx.server_ip)
+        }
+        _ => ctx.server_ip,
+    };
+    let is_script = q.url.ends_with(".ipxe") || q.url.ends_with(".cfg");
+    proxy_upstream_request(&ctx, client_srv_ip, &q.url, is_script).await
+}
+
+async fn proxy_upstream_request(
+    ctx: &HttpServerContext,
+    client_srv_ip: Ipv4Addr,
+    upstream_url: &str,
+    rewrite_ipxe: bool,
+) -> Response {
+    let is_ipxe_text = rewrite_ipxe
+        || upstream_url.ends_with(".ipxe")
+        || upstream_url.ends_with(".cfg");
+
+    if is_ipxe_text {
+        let output = match tokio::process::Command::new("curl")
+            .args([
+                "-L",
+                "-s",
+                "-S",
+                "-f",
+                "--connect-timeout",
+                "10",
+                upstream_url,
+            ])
+            .output()
+            .await
+        {
+            Ok(o) if o.status.success() => o,
+            Ok(o) => {
+                let err_msg = String::from_utf8_lossy(&o.stderr);
+                ctx.state.log(
+                    EventLevel::Warn,
+                    Protocol::Http,
+                    format!("Proxy fetch failed for {upstream_url}: {err_msg}"),
+                );
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("Upstream fetch failed: {err_msg}"),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Proxy spawn error: {e}"),
+                )
+                    .into_response();
+            }
+        };
+
+        let text = String::from_utf8_lossy(&output.stdout);
+        let local_base = format!("http://{}:{}", client_srv_ip, ctx.http_port);
+        let rewritten = text
+            .replace(
+                "set boot_domain boot.netboot.xyz",
+                &format!(
+                    "set boot_domain {}:{}/netboot.xyz\nset conn_type http\nset version 3.x",
+                    client_srv_ip, ctx.http_port
+                ),
+            )
+            .replace(
+                "iseq ${version} ${latest_version} && goto version_up2date ||",
+                "goto version_up2date",
+            )
+            .replace(
+                "set live_endpoint https://github.com/netbootxyz",
+                &format!("set live_endpoint {local_base}/gh-mirror"),
+            )
+            .replace("set sigs_enabled true", "set sigs_enabled false")
+            .replace(
+                "https://boot.netboot.xyz/",
+                &format!("{local_base}/netboot.xyz/"),
+            )
+            .replace(
+                "http://boot.netboot.xyz/",
+                &format!("{local_base}/netboot.xyz/"),
+            )
+            .replace(
+                "https://github.com/netbootxyz/",
+                &format!("{local_base}/gh-mirror/"),
+            )
+            .replace("ntp 0.pool.ntp.org", "# ntp skipped on direct cable");
+
+        (
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            )],
+            rewritten,
+        )
+            .into_response()
+    } else {
+        // Stream binary asset (vmlinuz, initrd, squashfs, etc.) directly from curl stdout to HTTP client
+        ctx.state.log(
+            EventLevel::Info,
+            Protocol::Http,
+            format!("Proxying binary stream: {upstream_url}"),
+        );
+
+        // Probe Content-Length via HEAD request so iPXE / archiso progress bar works
+        let mut content_len: Option<u64> = None;
+        if let Ok(head_out) = tokio::process::Command::new("curl")
+            .args(["-sIL", "--connect-timeout", "8", upstream_url])
+            .output()
+            .await
+            && head_out.status.success()
+        {
+            let headers_str = String::from_utf8_lossy(&head_out.stdout);
+            for line in headers_str.lines() {
+                let lower = line.to_ascii_lowercase();
+                if let Some(rest) = lower.strip_prefix("content-length:")
+                    && let Ok(val) = rest.trim().parse::<u64>()
+                    && val > 0
+                {
+                    content_len = Some(val);
+                }
+            }
+        }
+
+        let mut child = match tokio::process::Command::new("curl")
+            .args([
+                "-L",
+                "-s",
+                "-S",
+                "-f",
+                "--connect-timeout",
+                "15",
+                upstream_url,
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to stream upstream binary: {e}"),
+                )
+                    .into_response();
+            }
+        };
+
+        let Some(stdout) = child.stdout.take() else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+
+        let stream = futures::stream::unfold(
+            (stdout, child),
+            |(mut out, mut proc)| async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = vec![0u8; 64 * 1024];
+                match out.read(&mut buf).await {
+                    Ok(0) => {
+                        let _ = proc.wait().await;
+                        None
+                    }
+                    Ok(n) => {
+                        buf.truncate(n);
+                        Some((Ok::<Vec<u8>, std::io::Error>(buf), (out, proc)))
+                    }
+                    Err(e) => {
+                        let _ = proc.kill().await;
+                        Some((Err(e), (out, proc)))
+                    }
+                }
+            },
+        );
+
+        let mut builder = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/octet-stream");
+        if let Some(len) = content_len {
+            builder = builder.header(header::CONTENT_LENGTH, len.to_string());
+        }
+        builder
+            .body(Body::from_stream(stream))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    }
 }
 
 pub fn generate_default_ipxe_script(server_ip: Ipv4Addr, http_port: u16) -> String {

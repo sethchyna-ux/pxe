@@ -199,9 +199,14 @@ impl DhcpPacket {
         buf.extend_from_slice(&self.file);
         buf.extend_from_slice(&MAGIC_COOKIE);
 
-        // Sort options deterministically for testing and RFC conformity
+        // Sort options deterministically, but RFC 2131 requires Option 53 (Message Type)
+        // and Option 54 (Server Identifier) to appear first in the options block.
         let mut keys: Vec<&u8> = self.options.keys().collect();
-        keys.sort();
+        keys.sort_by_key(|&&k| match k {
+            53 => (0u8, k),
+            54 => (1u8, k),
+            _ => (2u8, k),
+        });
 
         for &key in keys {
             if let Some(val) = self.options.get(&key) {

@@ -193,14 +193,9 @@ pub fn is_direct_ethernet_link(server_ip: Ipv4Addr) -> bool {
 }
 
 pub fn detect_primary_ipv4() -> Option<Ipv4Addr> {
-    // 1. Prefer the interface carrying the active default LAN/gateway route (e.g. 192.168.1.x)
-    if let Some(ipv4) = detect_default_route_ipv4() {
-        return Some(ipv4);
-    }
-
     let interfaces = list_network_interfaces();
 
-    // 2. Prefer wired Ethernet interfaces if no default route is available
+    // 1. Prefer wired Ethernet interfaces first (e.g. macOS en4 10.77.0.3 direct 2.5GbE cable, Linux eno*/eth*/enp*)
     for (name, ip) in &interfaces {
         let is_linux_wired = name.starts_with("eno")
             || name.starts_with("eth")
@@ -214,6 +209,11 @@ pub fn detect_primary_ipv4() -> Option<Ipv4Addr> {
         if is_linux_wired || is_macos_wired {
             return Some(*ip);
         }
+    }
+
+    // 2. Fallback to default internet/LAN route interface (e.g. en0 Wi-Fi)
+    if let Some(ipv4) = detect_default_route_ipv4() {
+        return Some(ipv4);
     }
 
     // 3. Offline fallback
